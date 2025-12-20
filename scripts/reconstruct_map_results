@@ -1,0 +1,583 @@
+#!/usr/bin/env python3
+"""
+Reconstruct r_array, K_array, and densities from saved NumPyro MAP parameters.
+
+Assumptions
+-----------
+- params contains ONLY sampled random variables (MAP or posterior draw)
+- data matches exactly the data dict used during model fitting
+- No deterministic nodes were saved during inference
+
+Outputs
+-------
+- r_array      : (time, Ny, Nx)
+- K_array      : (time, Ny, Nx)
+- densities    : (time, Ny, Nx)
+"""
+
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+import jax
+import jax.numpy as jnp
+import jax.nn as jnn
+
+from numpyro.contrib.hsgp.approximation import linear_approximation
+from numpyro.contrib.hsgp.spectral_densities import (
+    diag_spectral_density_squared_exponential
+)
+import numpy as np
+from src.ingest_directional import build_data_jax
+
+import matplotlib.pyplot as plt
+
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter
+
+from src.model import precompute_s_Q_vectorized
+from src.model import forward_sim_2d
+
+
+def save_field_timeseries(
+    r_array,
+    K_array,
+    densities,
+    obs_rows,
+    obs_cols,
+    obs_time_indices,
+    observed_results,
+    out_dir="figures/fields",
+    prefix="fields",
+    dpi=150,
+    flipud=False,
+    log_eps=1e-12,
+    obs_smooth_sigma=None,
+):
+    """
+    Save r, K, densities, log-densities, r-sign, and observed-only density maps.
+
+    Layout: 2 x 3
+
+    Row 1: r | K | densities
+    Row 2: log(densities) | r > 0 | observed density
+    """
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    r_array = np.asarray(r_array)
+    K_array = np.asarray(K_array)
+    densities = np.asarray(densities)
+
+    obs_rows = np.asarray(obs_rows)
+    obs_cols = np.asarray(obs_cols)
+    obs_time_indices = np.asarray(obs_time_indices)
+    observed_results = np.asarray(observed_results)
+
+    T, Ny, Nx = r_array.shape
+
+    for t in range(T):
+        r = r_array[t]
+        K = K_array[t]
+        D = densities[t]
+
+        if flipud:
+            r = np.flipud(r)
+            K = np.flipud(K)
+            D = np.flipud(D)
+
+        logD = np.log(D + log_eps)
+        r_binary = (r > 0).astype(float)
+
+        # -----------------------------
+        # Observed-only grid
+        # -----------------------------
+        obs_grid = np.full((Ny, Nx), np.nan)
+        obs_mask_t = obs_time_indices == t
+
+        if np.any(obs_mask_t):
+            rows_t = obs_rows[obs_mask_t]
+            cols_t = obs_cols[obs_mask_t]
+            vals_t = observed_results[obs_mask_t]
+
+            for i, j in np.unique(np.column_stack([rows_t, cols_t]), axis=0):
+                m = (rows_t == i) & (cols_t == j)
+                obs_grid[i, j] = vals_t[m].mean()
+
+        if flipud:
+            obs_grid = np.flipud(obs_grid)
+
+        # -----------------------------
+        # Optional spatial smoothing
+        # -----------------------------
+        if obs_smooth_sigma is not None:
+            valid = ~np.isnan(obs_grid)
+            filled = np.where(valid, obs_grid, 0.0)
+
+            smoothed = gaussian_filter(filled, sigma=obs_smooth_sigma)
+            weight = gaussian_filter(valid.astype(float), sigma=obs_smooth_sigma)
+
+            with np.errstate(invalid="ignore", divide="ignore"):
+                obs_grid = np.where(weight > 0, smoothed / weight, np.nan)
+
+        # -----------------------------
+        # Plot
+        # -----------------------------
+        fig, axes = plt.subplots(
+            2, 3, figsize=(18, 10), constrained_layout=True
+        )
+
+        im = axes[0, 0].imshow(r)
+        axes[0, 0].set_title(f"r (t={t})")
+        plt.colorbar(im, ax=axes[0, 0], fraction=0.046)
+
+        im = axes[0, 1].imshow(K)
+        axes[0, 1].set_title("K")
+        plt.colorbar(im, ax=axes[0, 1], fraction=0.046)
+
+        im = axes[0, 2].imshow(D)
+        axes[0, 2].set_title("densities")
+        plt.colorbar(im, ax=axes[0, 2], fraction=0.046)
+
+        im = axes[1, 0].imshow(logD)
+        axes[1, 0].set_title("log densities")
+        plt.colorbar(im, ax=axes[1, 0], fraction=0.046)
+
+        im = axes[1, 1].imshow(
+            r_binary, vmin=0, vmax=1
+        )
+        axes[1, 1].set_title("r > 0")
+        plt.colorbar(im, ax=axes[1, 1], fraction=0.046, ticks=[0, 1])
+
+        im = axes[1, 2].imshow(obs_grid)
+        axes[1, 2].set_title("observed density")
+        plt.colorbar(im, ax=axes[1, 2], fraction=0.046)
+
+        for ax in axes.flat:
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+        fname = os.path.join(out_dir, f"{prefix}_t{t:04d}.png")
+        fig.savefig(fname, dpi=dpi)
+        plt.close(fig)
+
+
+# ---------------------------------------------------------------------
+# HSGP reconstruction
+# ---------------------------------------------------------------------
+
+def rebuild_hsgp(phi, w, alpha_raw, length_raw, ell, m_per_dim, dim):
+    """
+    Rebuild GP output from HSGP latent weights.
+    """
+    alpha = jnn.softplus(alpha_raw)
+    length = jnn.softplus(length_raw)
+
+    spd = jnp.sqrt(
+        diag_spectral_density_squared_exponential(
+            alpha=alpha,
+            length=length,
+            ell=ell,
+            m=m_per_dim,
+            dim=dim,
+        )
+    )
+
+    return phi @ (spd * w)
+
+
+# ---------------------------------------------------------------------
+# Growth-field reconstruction
+# ---------------------------------------------------------------------
+
+def precompute_r_K(
+    time,
+    Ny,
+    Nx,
+    land_rows,
+    land_cols,
+    r_mean,
+    r_bioclim,
+    r_pop,
+    r_spatial,
+    r_temp,
+    K_raw_mean,
+    logK_bio,
+    logK_pop,
+):
+    """
+    Precompute r_array and K_array on the full 2D grid.
+    """
+
+    N_land = land_rows.shape[0]
+
+    r_pop = r_pop.reshape(time, N_land)
+    logK_pop = logK_pop.reshape(time, N_land)
+
+    r_vals = (
+        r_mean
+        + r_bioclim[None, :]
+        + r_spatial[None, :]
+        + r_pop
+        + r_temp[:, None]
+    )
+
+    K_vals = jnp.exp(
+        K_raw_mean
+        + logK_bio[None, :]
+        + logK_pop
+    )
+
+    r_array = jnp.zeros((time, Ny, Nx))
+    K_array = jnp.zeros((time, Ny, Nx))
+
+    t_idx = jnp.arange(time)[:, None]
+
+    r_array = r_array.at[t_idx, land_rows, land_cols].set(r_vals)
+    K_array = K_array.at[t_idx, land_rows, land_cols].set(K_vals)
+
+    return r_array, K_array
+
+
+# ---------------------------------------------------------------------
+# Forward simulation (imported logic, unchanged)
+# ---------------------------------------------------------------------
+
+def allee_factor(pop, allee_scalar, allee_intercept):
+    return jnn.sigmoid(pop * allee_scalar + allee_intercept)
+
+
+def reproduction_safe(N0, r, K, allee_scalar, allee_intercept, eps=1e-12):
+    g = jnp.exp(r)
+    denom = K + N0 * jnp.expm1(r) + eps
+    pop_new = g * N0 * K / denom
+    return allee_factor(N0, allee_scalar, allee_intercept) * pop_new
+
+
+def rightpad(A, Lx, Ly, pad_value=1e-9):
+    pad = jnp.ones((Ly, Lx)) * pad_value
+    return pad.at[:A.shape[0], :A.shape[1]].set(A)
+
+
+def rightpad_convolution(pop, kernel):
+    Ly, Lx = kernel.shape
+    pop_pad = rightpad(pop, Lx, Ly)
+    conv = jnp.fft.ifft2(jnp.fft.fft2(pop_pad) * kernel)
+    return jnp.real(conv)[:pop.shape[0], :pop.shape[1]]
+
+def juvenile_dispersal_vectorized(
+    juvenile_dispersers: jnp.ndarray,       # (Ny, Nx)
+    juvenile_fft_kernels: jnp.ndarray,      # (4, Ly, Lx)
+    juvenile_edge_corrections: jnp.ndarray, # (4, Ny, Nx)
+    Q: jnp.ndarray,                         # (4, Ny, Nx)
+    dirichlet_weights: jnp.ndarray = None,
+    pad_value: float = 1e-9,
+):
+    """
+    Vectorized juvenile dispersal across four directional kernels with mortality.
+
+    Returns
+    -------
+    pop_after: (Ny, Nx) array after dispersal and survival
+    """
+    Ny, Nx = juvenile_dispersers.shape
+    Nd = juvenile_fft_kernels.shape[0]  # should be 4
+
+    # ----------------------------
+    # Determine directional subpopulations
+    # ----------------------------
+    if dirichlet_weights is None:
+        dirichlet_weights = jnp.ones(Nd) / Nd
+    dirichlet_weights = dirichlet_weights.reshape(Nd, 1, 1)  # broadcastable
+    dirichlet_weights *= Nd # Quick fix as directional kernels each have 1/Nd mass
+    pop_split = juvenile_dispersers[None, :, :] * dirichlet_weights * juvenile_edge_corrections  # (4, Ny, Nx)
+
+    # ----------------------------
+    # Pad pop for FFT
+    # ----------------------------
+    Ly, Lx = juvenile_fft_kernels.shape[1:]
+    pop_pad = jnp.pad(pop_split, ((0,0), (0, Ly-Ny), (0, Lx-Nx)), constant_values=pad_value)  # (4, Ly, Lx)
+
+    # ----------------------------
+    # FFT-based convolution (all directions at once)
+    # ----------------------------
+    fft_pop = jnp.fft.fft2(pop_pad, axes=(-2,-1))
+    conv = jnp.fft.ifft2(fft_pop * juvenile_fft_kernels, axes=(-2,-1))
+    conv_real = jnp.real(conv)[:, :Ny, :Nx]  # crop back to original size
+
+    # ----------------------------
+    # Apply Q (survival)
+    # ----------------------------
+    conv_corrected = conv_real * Q  # all broadcasted
+
+    # ----------------------------
+    # Sum over directions
+    # ----------------------------
+    pop_after = jnp.sum(conv_corrected, axis=0)
+
+    return pop_after
+
+def dispersal_step(pop, K,
+                   dispersal_logit_intercept=0.0,
+                   dispersal_logit_slope=10.0,
+                   target_fraction=0.8,
+                   dispersal_intercept=0.0,
+                   dispersal_random=None,
+                   adult_edge_correction=1.0,
+                   juvenile_edge_correction_stack=1.0,
+                   adult_fft_kernel=None,
+                   juvenile_fft_kernel_stack=None,
+                   Q_array=None,
+                   eps=1e-6,
+                   clip_z=30.0,
+                   min_p=1e-8):
+    """
+    Full dispersal step with numerical stability, juvenile/adult split, and convolution update.
+    
+    Parameters
+    ----------
+    pop : array
+        Current population at all grid cells.
+    K : array
+        Carrying capacity at all grid cells.
+    dispersal_logit_intercept : float
+        Baseline logit for total dispersal probability.
+    dispersal_logit_slope : float
+        Steepness of total dispersal probability vs relative density.
+    target_fraction : float
+        Fraction of K where dispersal probability ~0.5.
+    dispersal_intercept : float
+        Baseline juvenile dispersal probability (logit) modifier.
+    dispersal_random : array
+        Random temporal variation for juvenile dispersal (same shape as pop).
+    adult_edge_correction : float or array
+        Edge correction multiplier for adults.
+    juvenile_edge_correction : float or array
+        Edge correction multiplier for juveniles.
+    adult_fft_kernel : array
+        Convolution kernel for adult dispersal.
+    juvenile_fft_kernel : array
+        Convolution kernel for juvenile dispersal.
+    eps : float
+        Small number added to K to avoid division by zero.
+    clip_z : float
+        Maximum absolute value of sigmoid input for stability.
+    min_p : float
+        Minimum/maximum probability to avoid exact 0 or 1.
+    
+    Returns
+    -------
+    pop_new : array
+        Updated population after dispersal step.
+    dispersers : array
+        Total number of dispersers (for diagnostics if needed).
+    """
+    # -----------------------------
+    # Total dispersal probability
+    # -----------------------------
+    K_safe = K + eps
+    z_total = dispersal_logit_intercept + dispersal_logit_slope * (pop / K_safe - target_fraction)
+    z_total = jnp.clip(z_total, -clip_z, clip_z)
+    p_total = jnn.sigmoid(z_total)
+    p_total = jnp.clip(p_total, min_p, 1 - min_p)
+    
+    dispersers = p_total * pop
+
+    # -----------------------------
+    # Juvenile vs adult split
+    # -----------------------------
+    if dispersal_random is None:
+        dispersal_random = jnp.zeros_like(pop)
+        
+    z_juvenile = dispersal_intercept + dispersal_random
+    z_juvenile = jnp.clip(z_juvenile, -clip_z, clip_z)
+    p_juvenile = jnn.sigmoid(z_juvenile)
+    p_juvenile = jnp.clip(p_juvenile, min_p, 1 - min_p)
+
+    juvenile_dispersers = dispersers * p_juvenile
+    adult_dispersers = dispersers - juvenile_dispersers
+
+    # -----------------------------
+    # Convolution for dispersal movement
+    # -----------------------------
+    adult_update = rightpad_convolution(adult_dispersers * adult_edge_correction, adult_fft_kernel)
+    # juvenile_update = rightpad_convolution(juvenile_dispersers * juvenile_edge_correction, juvenile_fft_kernel)
+
+    juvenile_update = juvenile_dispersal_vectorized(
+        juvenile_dispersers=juvenile_dispersers,
+        juvenile_fft_kernels = juvenile_fft_kernel_stack, 
+        juvenile_edge_corrections=juvenile_edge_correction_stack,
+        Q=Q_array,
+    )
+    pop_update = adult_update + juvenile_update - dispersers
+
+    # -----------------------------
+    # Update population
+    # -----------------------------
+    pop_new = pop + pop_update
+
+    return pop_new
+
+
+
+
+# ---------------------------------------------------------------------
+# Full reconstruction pipeline
+# ---------------------------------------------------------------------
+
+def reconstruct_fields(params, data):
+    """
+    Main reconstruction entry point.
+    """
+
+    # ---- Bioclim GP ----
+    f_bio_1 = rebuild_hsgp(
+        data["phi_bioclim"],
+        params["f1_bio/beta"],
+        params["alpha_bio_raw"],
+        params["length_bio_raw"],
+        data["ell_bioclim"],
+        data["m_bioclim"],
+        data["d_bioclim"],
+    )
+
+    f_bio_2 = rebuild_hsgp(
+        data["phi_bioclim"],
+        params["f2_bio/beta"],
+        params["alpha_bio_raw"],
+        params["length_bio_raw"],
+        data["ell_bioclim"],
+        data["m_bioclim"],
+        data["d_bioclim"],
+    )
+
+    r_bio, logK_bio = params["L_bio"] @ jnp.stack([f_bio_1, f_bio_2])
+
+    # ---- Human population GP ----
+    f_pop = rebuild_hsgp(
+        data["phi_pop"],
+        params["pop/beta"],
+        params["pop/alpha_pop_raw"],
+        params["pop/length_pop_raw"],
+        data["ell_pop"],
+        data["m_pop"],
+        dim=1,
+    )
+
+    r_pop = params["pop/b_r"] * f_pop
+    logK_pop = params["pop/b_K"] * f_pop
+
+    # ---- Scalars ----
+    allee_slope = jnn.softplus(params["allee_slope_raw"])
+    allee_scalar = data["pop_scalar"] * allee_slope
+
+    inv_pop = jnn.softplus(params["inv_eta"]) # not scalar anymore?
+    # inv_pop = 100
+
+    # ---- r, K fields ----
+    r_array, K_array = precompute_r_K(
+        time=data["time"],
+        Ny=data["Ny"],
+        Nx=data["Nx"],
+        land_rows=data["land_rows"],
+        land_cols=data["land_cols"],
+        r_mean=params["r_mean"],
+        r_bioclim=r_bio,
+        r_pop=r_pop,
+        r_spatial=params["r_spatial"],
+        r_temp=params["r_temp"],
+        K_raw_mean=params["K_raw_mean"],
+        logK_bio=logK_bio,
+        logK_pop=logK_pop,
+    )
+
+    s_array, Q_array = precompute_s_Q_vectorized(
+        r_array,
+        data['juvenile_fft_kernel_stack'],      # (4, Ny, Nx), directions first
+        jnn.softplus(params["dispersal_survival_slope_raw"]),               # slope for survival of dispersing juveniles
+        params["dispersal_survival_threshold"]            # threshold for survival of dispersing juveniles
+    )
+
+    # ---- Forward simulation ----
+    densities = forward_sim_2d(
+        time=data["time"],
+        initial_pop=data['initpop_latent'],
+        r_array=r_array,
+        K_array=K_array,
+        dispersal_logit_intercept=params["dispersal_logit_intercept"],
+        dispersal_logit_slope=params["dispersal_logit_slope"],
+        dispersal_intercept=params["dispersal_intercept"],
+        dispersal_random=params["dispersal_random"],
+        adult_fft_kernel=data['adult_fft_kernel'],
+        juvenile_fft_kernel_stack=data['juvenile_fft_kernel_stack'],
+        adult_edge_correction=data['adult_edge_correction'],
+        juvenile_edge_correction_stack=data['juvenile_edge_correction_stack'],
+        Q_array=Q_array,
+        land_mask=data['land_mask'],
+        inv_pop=inv_pop,
+        inv_location=data['inv_location'],
+        inv_timestep = data['inv_timestep'],
+        allee_scalar=allee_scalar,
+        allee_intercept=params["allee_intercept"],
+        pseudo_zero=data['pseudo_zero']
+    )
+
+    return r_array, K_array, s_array, Q_array, densities
+
+
+# ---------------------------------------------------------------------
+# I/O wiring (EDIT THESE PATHS)
+# ---------------------------------------------------------------------
+
+
+
+def main(
+    map_path="map_estimate_4.npz",
+    data_path="data/stan_data_for_python.npz",
+    output_path="reconstructed_fields_4.npz",
+):
+    # -----------------------------
+    # Load MAP parameters
+    # -----------------------------
+    with np.load(map_path) as z:
+        params = {k: jnp.asarray(v) for k, v in z.items()}
+
+    # -----------------------------
+    # Rebuild data exactly as in MAP
+    # -----------------------------
+    data = build_data_jax(data_path)
+
+    # -----------------------------
+    # Reconstruct fields
+    # -----------------------------
+    r_array, K_array, s_array, Q_array, densities = reconstruct_fields(params, data)
+
+    # -----------------------------
+    # Save outputs
+    # -----------------------------
+    np.savez(
+        output_path,
+        r_array=np.asarray(r_array),
+        K_array=np.asarray(K_array),
+        densities=np.asarray(densities),
+    )
+
+    save_field_timeseries(
+        r_array,
+        K_array,
+        densities,
+        obs_rows=data["obs_rows"],
+        obs_cols=data["obs_cols"],
+        obs_time_indices=data["obs_time_indices"],
+        observed_results=data["observed_results"],
+        out_dir="figures/fields7",
+        prefix="rkD_obs",
+        obs_smooth_sigma=1.0, 
+    )
+
+    print("all done")
+
+if __name__ == "__main__":
+    main()
