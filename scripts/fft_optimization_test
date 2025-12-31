@@ -1,0 +1,91 @@
+import time
+import jax
+import jax.numpy as jnp
+import numpy as np
+
+
+def make_fft_fns(shape, device):
+    """Create JIT-compiled FFT and IFFT batch functions on a specific device."""
+    arr = jnp.ones(shape, dtype=jnp.complex64)
+    arr = jax.device_put(arr, device=device)
+
+    @jax.jit
+    def fft_batch(x):
+        for _ in range(20):
+            x = jnp.fft.fft2(x)
+        return x
+
+    @jax.jit
+    def ifft_batch(x):
+        for _ in range(20):
+            x = jnp.fft.ifft2(x)
+        return x
+
+    return arr, fft_batch, ifft_batch
+
+
+def benchmark_op(arr, fn, n_repeats=10):
+    """Benchmark a single operation (FFT or IFFT) robustly."""
+    # Warmup
+    _ = fn(arr).block_until_ready()
+
+    times = []
+    for _ in range(n_repeats):
+        start = time.time()
+        out = fn(arr)
+        out.block_until_ready()
+        end = time.time()
+        times.append(end - start)
+
+    # Each call performs 20 FFTs/IFFTs
+    times = np.array(times) / 20.0
+    return times.mean(), times.std()
+
+
+def run_fft_benchmarks(Ny, Nx):
+    print(f"\n=== ROBUST FFT/IFFT Benchmark for grid {Ny} x {Nx} ===")
+
+    # Minimal linear-convolution sizes
+    Ly_min = 2 * Ny - 1
+    Lx_min = 2 * Nx - 1
+
+    def next_pow2(n):
+        return 1 << (n - 1).bit_length()
+
+    Ly_pow2 = next_pow2(Ly_min)
+    Lx_pow2 = next_pow2(Lx_min)
+
+    shapes = {
+        "minimal (2N-1)": (Ly_min, Lx_min),
+        "next power of 2": (Ly_pow2, Lx_pow2),
+        "mixed (Ly_min, Lx_pow2)": (Ly_min, Lx_pow2),
+        "mixed (Ly_pow2, Lx_min)": (Ly_pow2, Lx_min),
+    }
+
+    # Devices
+    gpu = jax.devices("gpu")[0] if jax.devices("gpu") else None
+    cpu = jax.devices("cpu")[0]
+
+    for label, shape in shapes.items():
+        print(f"\n--- Shape {shape} ({label}) ---")
+
+        # GPU benchmark
+        if gpu:
+            arr, fft_batch, ifft_batch = make_fft_fns(shape, gpu)
+            fft_mean, fft_std = benchmark_op(arr, fft_batch)
+            ifft_mean, ifft_std = benchmark_op(arr, ifft_batch)
+            print(f"GPU FFT2:   {fft_mean*1000:.3f} ± {fft_std*1000:.3f} ms")
+            print(f"GPU IFFT2:  {ifft_mean*1000:.3f} ± {ifft_std*1000:.3f} ms")
+        else:
+            print("No GPU available")
+
+        # CPU benchmark
+        arr, fft_batch, ifft_batch = make_fft_fns(shape, cpu)
+        fft_mean, fft_std = benchmark_op(arr, fft_batch)
+        ifft_mean, ifft_std = benchmark_op(arr, ifft_batch)
+        print(f"CPU FFT2:   {fft_mean*1000:.3f} ± {fft_std*1000:.3f} ms")
+        print(f"CPU IFFT2:  {ifft_mean*1000:.3f} ± {ifft_std*1000:.3f} ms")
+
+
+if __name__ == "__main__":
+    run_fft_benchmarks(220, 300)

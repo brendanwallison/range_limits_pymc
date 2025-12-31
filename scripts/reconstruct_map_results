@@ -40,6 +40,506 @@ from scipy.ndimage import gaussian_filter
 from src.model import precompute_s_Q_vectorized
 from src.model import forward_sim_2d
 
+import pickle
+
+from numpyro.optim import Adam
+from src.model import build_model_2d
+from src.ingest_directional import build_data_jax
+from numpyro.infer.autoguide import AutoDelta
+from numpyro.infer.util import constrain_fn
+from numpyro import handlers
+
+def load_checkpoint_params(ckpt_path, data):
+    """
+    Load SVI checkpoint and reconstruct constrained MAP parameters
+    using constrain_fn, passing required model arguments.
+    """
+    with open(ckpt_path, "rb") as f:
+        ckpt = pickle.load(f)
+
+    svi_state = ckpt["svi_state"]
+    optimizer = Adam(ckpt["config"]["lr"])
+    model = build_model_2d
+    seeded_model = handlers.seed(model, ckpt["rng_key"])
+
+    # Extract unconstrained parameters from optimizer state
+    params_auto = optimizer.get_params(svi_state.optim_state)
+    params_clean = {k.replace("_auto_loc",""): v for k,v in params_auto.items()}
+
+    # Constrain parameters using the model and required data argument
+    params_constrained = constrain_fn(
+        seeded_model,
+        (data,),      # tuple of positional args
+        {},           # model_kwargs
+        params=params_clean
+    )
+
+    return params_constrained
+
+
+def load_map_params(map_path):
+    """Load a plain .npz map estimate (flat mapping name->array)."""
+    with np.load(map_path) as z:
+        return {k: jnp.asarray(v) for k, v in z.items()}
+
+# -----------------------------
+# Helper functions
+# -----------------------------
+
+FJ = 0.5  # juvenile fraction (fixed as requested)
+
+
+def _compute_r_eff(r, Q):
+    """
+    Compute effective growth rate:
+      r_eff = r + log(1 - fJ + fJ * Q)
+    """
+    return r + np.log(1.0 - FJ + FJ * Q + 1e-12)
+
+
+def _plot_r_eff_timestep(r, s, Qt, direction_keys, t, out_path, dpi=150):
+    """
+    Plot 2x3 layout:
+      Row 1: r_eff(no-disp=S) | r_eff(N) | r_eff(S)
+      Row 2: r_eff(E)         | r_eff(W) | r_eff(mean)
+    """
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
+
+    # No-dispersal (degenerate path)
+    r_eff_nodisp = _compute_r_eff(r, s)
+    im = axes[0, 0].imshow(r_eff_nodisp)
+    axes[0, 0].set_title(f"r_eff no-disp t={t}")
+    plt.colorbar(im, ax=axes[0, 0], fraction=0.046)
+
+    r_eff_dirs = []
+
+    for idx, (ax, key) in enumerate(
+        zip([axes[0,1], axes[0,2], axes[1,0], axes[1,1]], direction_keys)
+    ):
+        r_eff_d = _compute_r_eff(r, Qt[idx])
+        r_eff_dirs.append(r_eff_d)
+        im = ax.imshow(r_eff_d)
+        ax.set_title(f"r_eff {key} t={t}")
+        plt.colorbar(im, ax=ax, fraction=0.046)
+
+    # Directional mean
+    r_eff_mean = np.mean(r_eff_dirs, axis=0)
+    im = axes[1, 2].imshow(r_eff_mean)
+    axes[1, 2].set_title(f"r_eff mean t={t}")
+    plt.colorbar(im, ax=axes[1, 2], fraction=0.046)
+
+    for ax in axes.flat:
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+
+
+def _plot_r_eff_timeavg(r_avg, s_avg, Q_avg, direction_keys, out_path, dpi=150):
+    """
+    Time-averaged r_eff visualization with same layout as timestep version.
+    """
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
+
+    r_eff_nodisp = _compute_r_eff(r_avg, s_avg)
+    im = axes[0, 0].imshow(r_eff_nodisp)
+    axes[0, 0].set_title("r_eff no-disp time-avg")
+    plt.colorbar(im, ax=axes[0, 0], fraction=0.046)
+
+    r_eff_dirs = []
+
+    for idx, (ax, key) in enumerate(
+        zip([axes[0,1], axes[0,2], axes[1,0], axes[1,1]], direction_keys)
+    ):
+        r_eff_d = _compute_r_eff(r_avg, Q_avg[idx])
+        r_eff_dirs.append(r_eff_d)
+        im = ax.imshow(r_eff_d)
+        ax.set_title(f"r_eff {key} time-avg")
+        plt.colorbar(im, ax=ax, fraction=0.046)
+
+    r_eff_mean = np.mean(r_eff_dirs, axis=0)
+    im = axes[1, 2].imshow(r_eff_mean)
+    axes[1, 2].set_title("r_eff mean time-avg")
+    plt.colorbar(im, ax=axes[1, 2], fraction=0.046)
+
+    for ax in axes.flat:
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+
+def _plot_timeavg_r_eff_masks(r_avg, s_avg, Q_avg, direction_keys, out_path, dpi=150):
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
+
+    r_eff_dirs = [_compute_r_eff(r_avg, Q_avg[i]) for i in range(4)]
+    r_eff_mean = _compute_r_eff(r_avg, Q_avg.mean(axis=0))
+    r_eff_nodisp = _compute_r_eff(r_avg, s_avg)
+
+    masks = [
+        (axes[0, 0], r_eff_dirs[0] > 0, f"source {direction_keys[0]} avg"),
+        (axes[0, 1], r_eff_dirs[1] > 0, f"source {direction_keys[1]} avg"),
+        (axes[0, 2], r_eff_mean > 0, "source mean Q avg"),
+        (axes[1, 0], r_eff_dirs[2] > 0, f"source {direction_keys[2]} avg"),
+        (axes[1, 1], r_eff_dirs[3] > 0, f"source {direction_keys[3]} avg"),
+        (axes[1, 2], r_eff_nodisp > 0, "source no dispersal avg"),
+    ]
+
+    for ax, mask, title in masks:
+        im = ax.imshow(mask.astype(float), vmin=0, vmax=1)
+        ax.set_title(title)
+        plt.colorbar(im, ax=ax, fraction=0.046, ticks=[0, 1])
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+
+
+def _plot_r_eff_diff_timestep(r, s, Qt, direction_keys, t, out_path, dpi=150):
+    """
+    2x3 layout of Δr_eff = r_eff(directional) - r_eff(no dispersal)
+      Row 1: N | S | mean Q
+      Row 2: E | W | zero baseline
+    """
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
+
+    r_eff_nodisp = _compute_r_eff(r, s)
+    r_eff_dirs = [_compute_r_eff(r, Qt[i]) for i in range(4)]
+    r_eff_mean = _compute_r_eff(r, Qt.mean(axis=0))
+
+    diffs = [
+        (axes[0, 0], r_eff_dirs[0] - r_eff_nodisp, f"Δr_eff {direction_keys[0]}"),
+        (axes[0, 1], r_eff_dirs[1] - r_eff_nodisp, f"Δr_eff {direction_keys[1]}"),
+        (axes[0, 2], r_eff_mean - r_eff_nodisp, "Δr_eff mean Q"),
+        (axes[1, 0], r_eff_dirs[2] - r_eff_nodisp, f"Δr_eff {direction_keys[2]}"),
+        (axes[1, 1], r_eff_dirs[3] - r_eff_nodisp, f"Δr_eff {direction_keys[3]}"),
+        (axes[1, 2], np.zeros_like(r), "no dispersal baseline"),
+    ]
+
+    for ax, field, title in diffs:
+        im = ax.imshow(field)
+        ax.set_title(title)
+        plt.colorbar(im, ax=ax, fraction=0.046)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+
+
+def _plot_r_eff_masks_timestep(r, s, Qt, direction_keys, t, out_path, dpi=150):
+    """
+    2x3 binary source–sink masks:
+      Row 1: N | S | mean Q
+      Row 2: E | W | no dispersal
+    """
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
+
+    r_eff_dirs = [_compute_r_eff(r, Qt[i]) for i in range(4)]
+    r_eff_mean = _compute_r_eff(r, Qt.mean(axis=0))
+    r_eff_nodisp = _compute_r_eff(r, s)
+
+    masks = [
+        (axes[0, 0], r_eff_dirs[0] > 0, f"source {direction_keys[0]}"),
+        (axes[0, 1], r_eff_dirs[1] > 0, f"source {direction_keys[1]}"),
+        (axes[0, 2], r_eff_mean > 0, "source mean Q"),
+        (axes[1, 0], r_eff_dirs[2] > 0, f"source {direction_keys[2]}"),
+        (axes[1, 1], r_eff_dirs[3] > 0, f"source {direction_keys[3]}"),
+        (axes[1, 2], r_eff_nodisp > 0, "source no dispersal"),
+    ]
+
+    for ax, mask, title in masks:
+        im = ax.imshow(mask.astype(float), vmin=0, vmax=1)
+        ax.set_title(title)
+        plt.colorbar(im, ax=ax, fraction=0.046, ticks=[0, 1])
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+
+def _plot_timeavg_r_eff_diff(r_avg, s_avg, Q_avg, direction_keys, out_path, dpi=150):
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
+
+    r_eff_nodisp = _compute_r_eff(r_avg, s_avg)
+    r_eff_dirs = [_compute_r_eff(r_avg, Q_avg[i]) for i in range(4)]
+    r_eff_mean = _compute_r_eff(r_avg, Q_avg.mean(axis=0))
+
+    diffs = [
+        (axes[0, 0], r_eff_dirs[0] - r_eff_nodisp, f"Δr_eff {direction_keys[0]} avg"),
+        (axes[0, 1], r_eff_dirs[1] - r_eff_nodisp, f"Δr_eff {direction_keys[1]} avg"),
+        (axes[0, 2], r_eff_mean - r_eff_nodisp, "Δr_eff mean Q avg"),
+        (axes[1, 0], r_eff_dirs[2] - r_eff_nodisp, f"Δr_eff {direction_keys[2]} avg"),
+        (axes[1, 1], r_eff_dirs[3] - r_eff_nodisp, f"Δr_eff {direction_keys[3]} avg"),
+        (axes[1, 2], np.zeros_like(r_avg), "no dispersal baseline"),
+    ]
+
+    for ax, field, title in diffs:
+        im = ax.imshow(field)
+        ax.set_title(title)
+        plt.colorbar(im, ax=ax, fraction=0.046)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+
+
+def _make_obs_grid_for_t(obs_rows, obs_cols, obs_time_indices, observed_results, t, Ny, Nx, flipud=False, obs_smooth_sigma=None):
+    """
+    Build observed-only grid for a single timestep t.
+    Returns an array shape (Ny, Nx) with NaNs where no observation exists.
+    """
+    obs_grid = np.full((Ny, Nx), np.nan)
+    mask_t = obs_time_indices == t
+    if np.any(mask_t):
+        rows_t = obs_rows[mask_t]
+        cols_t = obs_cols[mask_t]
+        vals_t = observed_results[mask_t]
+        for i, j in np.unique(np.column_stack([rows_t, cols_t]), axis=0):
+            m = (rows_t == i) & (cols_t == j)
+            obs_grid[i, j] = vals_t[m].mean()
+    if flipud:
+        obs_grid = np.flipud(obs_grid)
+
+    if obs_smooth_sigma is not None:
+        valid = ~np.isnan(obs_grid)
+        filled = np.where(valid, obs_grid, 0.0)
+        smoothed = gaussian_filter(filled, sigma=obs_smooth_sigma)
+        weight = gaussian_filter(valid.astype(float), sigma=obs_smooth_sigma)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            obs_grid = np.where(weight > 0, smoothed / weight, np.nan)
+
+    return obs_grid
+
+
+def _make_obs_grid_timeavg(obs_rows, obs_cols, observed_results, Ny, Nx, flipud=False):
+    """
+    Build observed grid averaged across all times (mean per cell).
+    """
+    obs_grid = np.full((Ny, Nx), np.nan)
+    if obs_rows.size > 0:
+        for i, j in np.unique(np.column_stack([obs_rows, obs_cols]), axis=0):
+            mask = (obs_rows == i) & (obs_cols == j)
+            if np.any(mask):
+                obs_grid[i, j] = observed_results[mask].mean()
+    if flipud:
+        obs_grid = np.flipud(obs_grid)
+    return obs_grid
+
+
+def _plot_main_timestep(r, K, D, obs_grid, t, out_path, dpi=150):
+    """
+    Plot the 2x3 layout for a single timestep and save to out_path.
+    """
+    logD = np.log(D + 1e-12)
+    r_binary = (r > 0).astype(float)
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
+
+    im = axes[0, 0].imshow(r)
+    axes[0, 0].set_title(f"r t={t}")
+    plt.colorbar(im, ax=axes[0, 0], fraction=0.046)
+
+    im = axes[0, 1].imshow(K)
+    axes[0, 1].set_title("K")
+    plt.colorbar(im, ax=axes[0, 1], fraction=0.046)
+
+    im = axes[0, 2].imshow(D)
+    axes[0, 2].set_title("densities")
+    plt.colorbar(im, ax=axes[0, 2], fraction=0.046)
+
+    im = axes[1, 0].imshow(logD)
+    axes[1, 0].set_title("log densities")
+    plt.colorbar(im, ax=axes[1, 0], fraction=0.046)
+
+    im = axes[1, 1].imshow(r_binary, vmin=0, vmax=1)
+    axes[1, 1].set_title("r > 0")
+    plt.colorbar(im, ax=axes[1, 1], fraction=0.046, ticks=[0, 1])
+
+    im = axes[1, 2].imshow(obs_grid)
+    axes[1, 2].set_title("observed density")
+    plt.colorbar(im, ax=axes[1, 2], fraction=0.046)
+
+    for ax in axes.flat:
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+
+
+def _plot_timeavg_main(r_avg, K_avg, D_avg, obs_grid_avg, out_path, dpi=150):
+    """
+    Plot the 2x3 time-averaged snapshot and save.
+    """
+    logD_avg = np.log(D_avg + 1e-12)
+    r_binary_avg = (r_avg > 0).astype(float)
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
+
+    im = axes[0, 0].imshow(r_avg)
+    axes[0, 0].set_title("r time-avg")
+    plt.colorbar(im, ax=axes[0, 0], fraction=0.046)
+
+    im = axes[0, 1].imshow(K_avg)
+    axes[0, 1].set_title("K time-avg")
+    plt.colorbar(im, ax=axes[0, 1], fraction=0.046)
+
+    im = axes[0, 2].imshow(D_avg)
+    axes[0, 2].set_title("densities time-avg")
+    plt.colorbar(im, ax=axes[0, 2], fraction=0.046)
+
+    im = axes[1, 0].imshow(logD_avg)
+    axes[1, 0].set_title("log densities time-avg")
+    plt.colorbar(im, ax=axes[1, 0], fraction=0.046)
+
+    im = axes[1, 1].imshow(r_binary_avg, vmin=0, vmax=1)
+    axes[1, 1].set_title("r > 0 time-avg")
+    plt.colorbar(im, ax=axes[1, 1], fraction=0.046, ticks=[0, 1])
+
+    im = axes[1, 2].imshow(obs_grid_avg)
+    axes[1, 2].set_title("observed density all times")
+    plt.colorbar(im, ax=axes[1, 2], fraction=0.046)
+
+    for ax in axes.flat:
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+
+def _plot_Qs_s_timestep(s, Qt, direction_keys, t, out_path, dpi=150):
+    """
+    Plot 2x3 layout:
+      Row 1: s | Q_N | Q_S
+      Row 2: Q_E | Q_W | Q_W - Q_E
+
+    Parameters
+    - s: 2D array or None
+    - Qt: 3D array shape (4, Ny, Nx) or None, order matches direction_keys
+    - direction_keys: list of 4 strings
+    - t: timestep index (for titles)
+    - out_path: filename to save
+    """
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
+
+    # Panel (0,0): s
+    ax = axes[0, 0]
+    if s is not None:
+        im = ax.imshow(s)
+        ax.set_title(f"s t={t}")
+        plt.colorbar(im, ax=ax, fraction=0.046)
+    else:
+        ax.axis("off")
+        ax.set_title("s missing")
+
+    # Panels (0,1) and (0,2): Q_N, Q_S
+    if Qt is not None:
+        # Q_N (index 0)
+        im = axes[0, 1].imshow(Qt[0])
+        axes[0, 1].set_title(f"Q {direction_keys[0]} t={t}")
+        plt.colorbar(im, ax=axes[0, 1], fraction=0.046)
+
+        # Q_S (index 1)
+        im = axes[0, 2].imshow(Qt[1])
+        axes[0, 2].set_title(f"Q {direction_keys[1]} t={t}")
+        plt.colorbar(im, ax=axes[0, 2], fraction=0.046)
+
+        # Q_E (index 2)
+        im = axes[1, 0].imshow(Qt[2])
+        axes[1, 0].set_title(f"Q {direction_keys[2]} t={t}")
+        plt.colorbar(im, ax=axes[1, 0], fraction=0.046)
+
+        # Q_W (index 3)
+        im = axes[1, 1].imshow(Qt[3])
+        axes[1, 1].set_title(f"Q {direction_keys[3]} t={t}")
+        plt.colorbar(im, ax=axes[1, 1], fraction=0.046)
+
+        # Q_W - Q_E
+        diff = Qt[3] - Qt[2]
+        im = axes[1, 2].imshow(diff)
+        axes[1, 2].set_title(f"Q {direction_keys[3]} - Q {direction_keys[2]} t={t}")
+        plt.colorbar(im, ax=axes[1, 2], fraction=0.046)
+    else:
+        # Turn off Q panels if Qt missing
+        for ax_idx, key in zip([(0,1),(0,2),(1,0),(1,1),(1,2)], direction_keys + ["W-E"]):
+            ax = axes[ax_idx]
+            ax.axis("off")
+            ax.set_title(f"Q {key} missing")
+
+    # Remove ticks
+    for ax in axes.flat:
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+
+
+def _plot_timeavg_Qs_s(s_avg, Q_avg, direction_keys, out_path, dpi=150):
+    """
+    Plot 2x3 time-averaged snapshot:
+      Row 1: s (time-avg) | Q_N (time-avg) | Q_S (time-avg)
+      Row 2: Q_E (time-avg) | Q_W (time-avg) | Q_W - Q_E (time-avg)
+    """
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
+
+    # s time-avg
+    ax = axes[0, 0]
+    if s_avg is not None:
+        im = ax.imshow(s_avg)
+        ax.set_title("s time-avg")
+        plt.colorbar(im, ax=ax, fraction=0.046)
+    else:
+        ax.axis("off")
+        ax.set_title("s missing")
+
+    if Q_avg is not None:
+        # Q_N
+        im = axes[0, 1].imshow(Q_avg[0])
+        axes[0, 1].set_title(f"Q {direction_keys[0]} time-avg")
+        plt.colorbar(im, ax=axes[0, 1], fraction=0.046)
+
+        # Q_S
+        im = axes[0, 2].imshow(Q_avg[1])
+        axes[0, 2].set_title(f"Q {direction_keys[1]} time-avg")
+        plt.colorbar(im, ax=axes[0, 2], fraction=0.046)
+
+        # Q_E
+        im = axes[1, 0].imshow(Q_avg[2])
+        axes[1, 0].set_title(f"Q {direction_keys[2]} time-avg")
+        plt.colorbar(im, ax=axes[1, 0], fraction=0.046)
+
+        # Q_W
+        im = axes[1, 1].imshow(Q_avg[3])
+        axes[1, 1].set_title(f"Q {direction_keys[3]} time-avg")
+        plt.colorbar(im, ax=axes[1, 1], fraction=0.046)
+
+        # Q_W - Q_E (time-avg)
+        diff = Q_avg[3] - Q_avg[2]
+        im = axes[1, 2].imshow(diff)
+        axes[1, 2].set_title(f"Q {direction_keys[3]} - Q {direction_keys[2]} time-avg")
+        plt.colorbar(im, ax=axes[1, 2], fraction=0.046)
+    else:
+        for ax_idx, key in zip([(0,1),(0,2),(1,0),(1,1),(1,2)], direction_keys + ["W-E"]):
+            ax = axes[ax_idx]
+            ax.axis("off")
+            ax.set_title(f"Q {key} missing")
+
+    for ax in axes.flat:
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+
+
+# -----------------------------
+# Top-level dispatcher
+# -----------------------------
 
 def save_field_timeseries(
     r_array,
@@ -49,22 +549,30 @@ def save_field_timeseries(
     obs_cols,
     obs_time_indices,
     observed_results,
+    Q_array=None,
+    s_array=None,
+    direction_keys=None,
     out_dir="figures/fields",
     prefix="fields",
     dpi=150,
     flipud=False,
     log_eps=1e-12,
     obs_smooth_sigma=None,
+    save_Qs_s=True,
+    save_timeavg=True,
 ):
     """
-    Save r, K, densities, log-densities, r-sign, and observed-only density maps.
+    Modular wrapper that dispatches to helper plotting functions.
 
-    Layout: 2 x 3
+    Behavior
+    - Saves per-timestep 2x3 figures for r, K, densities, log densities, r>0, observed.
+    - Optionally saves per-timestep 1x5 figures for s and Q (4 directions).
+    - Optionally saves time-averaged snapshots for both figure types.
 
-    Row 1: r | K | densities
-    Row 2: log(densities) | r > 0 | observed density
+    New optional flags
+    - save_Qs_s controls whether Q/s figures are produced.
+    - save_timeavg controls whether time-averaged snapshots are produced.
     """
-
     os.makedirs(out_dir, exist_ok=True)
 
     r_array = np.asarray(r_array)
@@ -76,92 +584,117 @@ def save_field_timeseries(
     obs_time_indices = np.asarray(obs_time_indices)
     observed_results = np.asarray(observed_results)
 
+    if direction_keys is None:
+        direction_keys = ["N", "S", "E", "W"]
+
     T, Ny, Nx = r_array.shape
 
+    # Validate optional arrays
+    if Q_array is not None:
+        Q_array = np.asarray(Q_array)
+        if Q_array.shape[0] != T:
+            raise ValueError("Q_array first dimension must match time T")
+        if Q_array.shape[1] != 4:
+            raise ValueError("Q_array second dimension must be 4 (directions)")
+
+    if s_array is not None:
+        s_array = np.asarray(s_array)
+        if s_array.shape[0] != T:
+            raise ValueError("s_array first dimension must match time T")
+
+    # Per-timestep loop
     for t in range(T):
-        r = r_array[t]
-        K = K_array[t]
-        D = densities[t]
+        r = r_array[t].copy()
+        K = K_array[t].copy()
+        D = densities[t].copy()
 
         if flipud:
             r = np.flipud(r)
             K = np.flipud(K)
             D = np.flipud(D)
 
-        logD = np.log(D + log_eps)
-        r_binary = (r > 0).astype(float)
+        obs_grid = _make_obs_grid_for_t(
+            obs_rows, obs_cols, obs_time_indices, observed_results, t, Ny, Nx,
+            flipud=flipud, obs_smooth_sigma=obs_smooth_sigma
+        )
 
-        # -----------------------------
-        # Observed-only grid
-        # -----------------------------
-        obs_grid = np.full((Ny, Nx), np.nan)
-        obs_mask_t = obs_time_indices == t
+        fname_main = os.path.join(out_dir, f"{prefix}_t{t:04d}.png")
+        _plot_main_timestep(r, K, D, obs_grid, t, fname_main, dpi=dpi)
 
-        if np.any(obs_mask_t):
-            rows_t = obs_rows[obs_mask_t]
-            cols_t = obs_cols[obs_mask_t]
-            vals_t = observed_results[obs_mask_t]
+        if save_Qs_s and ((s_array is not None) or (Q_array is not None)):
+            s_t = None if s_array is None else (np.flipud(s_array[t]) if flipud else s_array[t])
+            Q_t = None if Q_array is None else (np.flipud(Q_array[t], axis=1) if flipud else Q_array[t])
+            fname_qs = os.path.join(out_dir, f"{prefix}_Qs_s_t{t:04d}.png")
+            _plot_Qs_s_timestep(s_t, Q_t, direction_keys, t, fname_qs, dpi=dpi)
+            if s_array is not None and Q_array is not None:
+                fname_reff = os.path.join(out_dir, f"{prefix}_r_eff_t{t:04d}.png")
+                _plot_r_eff_timestep(r, s_t, Q_t, direction_keys, t, fname_reff, dpi=dpi)
+                fname_mask = os.path.join(out_dir, f"{prefix}_r_eff_mask_t{t:04d}.png")
+                _plot_r_eff_masks_timestep(
+                    r=r,
+                    s=s_t,
+                    Qt=Q_t,
+                    direction_keys=direction_keys,
+                    t=t,
+                    out_path=fname_mask,
+                    dpi=dpi,
+                )
 
-            for i, j in np.unique(np.column_stack([rows_t, cols_t]), axis=0):
-                m = (rows_t == i) & (cols_t == j)
-                obs_grid[i, j] = vals_t[m].mean()
+                # r_eff difference maps (vs no dispersal)
+                fname_diff = os.path.join(out_dir, f"{prefix}_r_eff_diff_t{t:04d}.png")
+                _plot_r_eff_diff_timestep(
+                    r=r,
+                    s=s_t,
+                    Qt=Q_t,
+                    direction_keys=direction_keys,
+                    t=t,
+                    out_path=fname_diff,
+                    dpi=dpi,
+                )
 
+
+    # Time-averaged snapshots
+    if save_timeavg:
+        r_avg = r_array.mean(axis=0)
+        K_avg = K_array.mean(axis=0)
+        D_avg = densities.mean(axis=0)
         if flipud:
-            obs_grid = np.flipud(obs_grid)
+            r_avg = np.flipud(r_avg)
+            K_avg = np.flipud(K_avg)
+            D_avg = np.flipud(D_avg)
 
-        # -----------------------------
-        # Optional spatial smoothing
-        # -----------------------------
-        if obs_smooth_sigma is not None:
-            valid = ~np.isnan(obs_grid)
-            filled = np.where(valid, obs_grid, 0.0)
+        obs_grid_avg = _make_obs_grid_timeavg(obs_rows, obs_cols, observed_results, Ny, Nx, flipud=flipud)
+        fname_avg = os.path.join(out_dir, f"{prefix}_timeavg.png")
+        _plot_timeavg_main(r_avg, K_avg, D_avg, obs_grid_avg, fname_avg, dpi=dpi)
 
-            smoothed = gaussian_filter(filled, sigma=obs_smooth_sigma)
-            weight = gaussian_filter(valid.astype(float), sigma=obs_smooth_sigma)
+        if save_Qs_s and ((s_array is not None) or (Q_array is not None)):
+            s_avg = None if s_array is None else (np.flipud(s_array.mean(axis=0)) if flipud else s_array.mean(axis=0))
+            Q_avg = None if Q_array is None else (np.flipud(Q_array.mean(axis=0), axis=1) if flipud else Q_array.mean(axis=0))
+            fname_qavg = os.path.join(out_dir, f"{prefix}_Qs_s_timeavg.png")
+            _plot_timeavg_Qs_s(s_avg, Q_avg, direction_keys, fname_qavg, dpi=dpi)
+            if s_array is not None and Q_array is not None:
+                fname_reff_avg = os.path.join(out_dir, f"{prefix}_r_eff_timeavg.png")
+                _plot_r_eff_timeavg(r_avg, s_avg, Q_avg, direction_keys, fname_reff_avg, dpi=dpi)
+                fname_mask_avg = os.path.join(out_dir, f"{prefix}_r_eff_mask_timeavg.png")
+                _plot_timeavg_r_eff_masks(
+                    r_avg=r_avg,
+                    s_avg=s_avg,
+                    Q_avg=Q_avg,
+                    direction_keys=direction_keys,
+                    out_path=fname_mask_avg,
+                    dpi=dpi,
+                )
 
-            with np.errstate(invalid="ignore", divide="ignore"):
-                obs_grid = np.where(weight > 0, smoothed / weight, np.nan)
+                fname_diff_avg = os.path.join(out_dir, f"{prefix}_r_eff_diff_timeavg.png")
+                _plot_timeavg_r_eff_diff(
+                    r_avg=r_avg,
+                    s_avg=s_avg,
+                    Q_avg=Q_avg,
+                    direction_keys=direction_keys,
+                    out_path=fname_diff_avg,
+                    dpi=dpi,
+                )
 
-        # -----------------------------
-        # Plot
-        # -----------------------------
-        fig, axes = plt.subplots(
-            2, 3, figsize=(18, 10), constrained_layout=True
-        )
-
-        im = axes[0, 0].imshow(r)
-        axes[0, 0].set_title(f"r (t={t})")
-        plt.colorbar(im, ax=axes[0, 0], fraction=0.046)
-
-        im = axes[0, 1].imshow(K)
-        axes[0, 1].set_title("K")
-        plt.colorbar(im, ax=axes[0, 1], fraction=0.046)
-
-        im = axes[0, 2].imshow(D)
-        axes[0, 2].set_title("densities")
-        plt.colorbar(im, ax=axes[0, 2], fraction=0.046)
-
-        im = axes[1, 0].imshow(logD)
-        axes[1, 0].set_title("log densities")
-        plt.colorbar(im, ax=axes[1, 0], fraction=0.046)
-
-        im = axes[1, 1].imshow(
-            r_binary, vmin=0, vmax=1
-        )
-        axes[1, 1].set_title("r > 0")
-        plt.colorbar(im, ax=axes[1, 1], fraction=0.046, ticks=[0, 1])
-
-        im = axes[1, 2].imshow(obs_grid)
-        axes[1, 2].set_title("observed density")
-        plt.colorbar(im, ax=axes[1, 2], fraction=0.046)
-
-        for ax in axes.flat:
-            ax.set_xticks([])
-            ax.set_yticks([])
-
-        fname = os.path.join(out_dir, f"{prefix}_t{t:04d}.png")
-        fig.savefig(fname, dpi=dpi)
-        plt.close(fig)
 
 
 # ---------------------------------------------------------------------
@@ -532,22 +1065,26 @@ def reconstruct_fields(params, data):
 # ---------------------------------------------------------------------
 
 
-
 def main(
     map_path="map_estimate_4.npz",
     data_path="data/stan_data_for_python.npz",
-    output_path="reconstructed_fields_4.npz",
+    output_path="reconstructed_fields_5.npz",
+    checkpoint_path="/home/breallis/dev/range_limits_pymc/checkpoints/map_ckpt_step29000.pkl",  # if provided, use checkpoint instead of map_path
 ):
-    # -----------------------------
-    # Load MAP parameters
-    # -----------------------------
-    with np.load(map_path) as z:
-        params = {k: jnp.asarray(v) for k, v in z.items()}
-
     # -----------------------------
     # Rebuild data exactly as in MAP
     # -----------------------------
     data = build_data_jax(data_path)
+
+    # -----------------------------
+    # Load parameters (checkpoint or map)
+    # -----------------------------
+    if checkpoint_path:
+        print(f"Loading checkpoint params from: {checkpoint_path}")
+        params = load_checkpoint_params(checkpoint_path, data)
+    else:
+        print(f"Loading MAP params from: {map_path}")
+        params = load_map_params(map_path)
 
     # -----------------------------
     # Reconstruct fields
@@ -572,12 +1109,15 @@ def main(
         obs_cols=data["obs_cols"],
         obs_time_indices=data["obs_time_indices"],
         observed_results=data["observed_results"],
-        out_dir="figures/fields7",
-        prefix="rkD_obs",
-        obs_smooth_sigma=1.0, 
+        s_array=s_array,
+        Q_array=Q_array,
+        out_dir="figures/fields8",
+        prefix="figs",
+        obs_smooth_sigma=1.0,
     )
 
     print("all done")
+
 
 if __name__ == "__main__":
     main()

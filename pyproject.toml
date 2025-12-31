@@ -1,0 +1,21 @@
+[project]
+name = "range-limits-pymc"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "dendropy>=5.0.8",
+    "jax[cuda11-cudnn82]>=0.8.1",
+    "jaxlib[cuda11-cudnn82]>=0.8.1",
+    "matplotlib>=3.10.8",
+    "numpy>=2.3.5",
+    "numpyro>=0.19.0",
+    "pandas>=2.3.3",
+    "pymc==5.26.1",
+    "rasterio>=1.4.4",
+    "requests>=2.32.5",
+    "rioxarray>=0.20.0",
+    "scikit-learn>=1.8.0",
+    "scipy>=1.16.3",
+]
