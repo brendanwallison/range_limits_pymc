@@ -6,450 +6,424 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from scipy.stats import spearmanr
+from scipy.ndimage import gaussian_filter1d
+
+# ============================================================
+# Spatial kernels (4 km grid)
+# ============================================================
+
+def nan_aware_gaussian(X, sigma):
+    mask = np.isfinite(X).astype(np.float32)
+    X = np.nan_to_num(X, nan=0.0)
+
+    num = gaussian_filter1d(X * mask, sigma, axis=0, mode="constant")
+    num = gaussian_filter1d(num,        sigma, axis=1, mode="constant")
+
+    den = gaussian_filter1d(mask, sigma, axis=0, mode="constant")
+    den = gaussian_filter1d(den,  sigma, axis=1, mode="constant")
+
+    out = num / (den + 1e-6)
+    out[den < 1e-6] = np.nan
+    return out
+
+def add_spatial_context(X):
+    feats = [X]
+    feats.append(nan_aware_gaussian(X, sigma=5.0))
+    # feats.append(nan_aware_gaussian(X, sigma=20.0))
+    return np.concatenate(feats, axis=-1)
 
 
-# ----------------------
-# Data Handling Utils
-# ----------------------
+
+# ============================================================
+# Data loading
+# ============================================================
 
 def load_tifs(folder, pattern):
     paths = sorted(glob.glob(os.path.join(folder, pattern)))
     arrays = []
     for p in paths:
         with rasterio.open(p) as src:
-            data = src.read()  # shape: (bands, H, W)
-            data = np.moveaxis(data, 0, -1)  # (H, W, bands)
-            data = data.astype(np.float32)
-            arrays.append(data)
-    if len(arrays) == 0:
-        raise ValueError(f"No files found in {folder} matching {pattern}")
-    # concatenate along last axis to get flat channel/features axis
-    data_all = np.concatenate(arrays, axis=-1)  # shape: (H, W, sum(bands over files))
-    return data_all
-
-
-def mask_prism(prism_array):
-    valid = ~np.any(np.isnan(prism_array), axis=-1)
-    return valid
-
-
-def mask_bui(bui_array):
-    valid = ~np.any(np.isnan(bui_array), axis=-1)
-    return valid
+            data = src.read()                  # (bands, H, W)
+            data = np.moveaxis(data, 0, -1)    # (H, W, bands)
+            arrays.append(data.astype(np.float32))
+    if not arrays:
+        raise ValueError(f"No files found: {folder}/{pattern}")
+    return np.concatenate(arrays, axis=-1)
 
 
 def mask_ebird(ebird_array):
     valid = np.any(~np.isnan(ebird_array), axis=-1)
-    ebird_array = np.nan_to_num(ebird_array, nan=0.0)
-    return valid, ebird_array
+    return valid, np.nan_to_num(ebird_array, nan=0.0)
 
-# ----------------------
-# Dataset with block splitting
-# ----------------------
+
+# ============================================================
+# Dataset
+# ============================================================
 
 class PixelDataset(Dataset):
-    def __init__(self, prism_array, bui_array, ebird_array, block_rows=8, block_cols=8, split='train'):
-        H, W, _ = prism_array.shape
-        self.blocks = []
+    def __init__(self, prism, bui, ebird, block_rows=8, block_cols=8, split="train"):
+        H, W, _ = prism.shape
+        blocks = []
+
         row_blocks = np.array_split(np.arange(H), block_rows)
         col_blocks = np.array_split(np.arange(W), block_cols)
 
-        for r_block in row_blocks:
-            for c_block in col_blocks:
-                prism_block = prism_array[r_block[:, None], c_block, :]
-                bui_block = bui_array[r_block[:, None], c_block, :]
-                ebird_block = ebird_array[r_block[:, None], c_block, :]
+        for rb in row_blocks:
+            for cb in col_blocks:
+                p = prism[rb[:, None], cb]
+                b = bui[rb[:, None], cb]
+                e = ebird[rb[:, None], cb]
 
-                prism_flat = prism_block.reshape(-1, prism_array.shape[-1])
-                bui_flat = bui_block.reshape(-1, bui_array.shape[-1])
-                ebird_flat = ebird_block.reshape(-1, ebird_array.shape[-1])
+                p = p.reshape(-1, prism.shape[-1])
+                b = b.reshape(-1, bui.shape[-1])
+                e = e.reshape(-1, ebird.shape[-1])
 
-                prism_mask = ~np.any(np.isnan(prism_flat), axis=1)
-                bui_mask = ~np.any(np.isnan(bui_flat), axis=1)
-                ebird_mask = np.any(ebird_flat != 0, axis=1)
-                valid_mask = prism_mask & bui_mask & ebird_mask
+                mask = (
+                    ~np.any(np.isnan(p), axis=1) &
+                    ~np.any(np.isnan(b), axis=1) &
+                    np.any(e != 0, axis=1)
+                )
 
-                if np.sum(valid_mask) == 0:
-                    continue
+                if mask.sum() > 0:
+                    blocks.append((
+                        torch.tensor(p[mask]),
+                        torch.tensor(b[mask]),
+                        torch.tensor(e[mask]),
+                    ))
 
-                self.blocks.append({
-                    'prism': torch.tensor(prism_flat[valid_mask], dtype=torch.float32),
-                    'bui': torch.tensor(bui_flat[valid_mask], dtype=torch.float32),
-                    'ebird': torch.tensor(ebird_flat[valid_mask], dtype=torch.float32)
-                })
+        split_idx = int(0.8 * len(blocks))
+        blocks = blocks[:split_idx] if split == "train" else blocks[split_idx:]
 
-        n_blocks = len(self.blocks)
-        split_idx = int(0.8 * n_blocks)
-        if split == 'train':
-            self.blocks = self.blocks[:split_idx]
-        else:
-            self.blocks = self.blocks[split_idx:]
-
-        self.data = {'prism': [], 'bui': [], 'ebird': []}
-        for b in self.blocks:
-            self.data['prism'].append(b['prism'])
-            self.data['bui'].append(b['bui'])
-            self.data['ebird'].append(b['ebird'])
-        self.data['prism'] = torch.cat(self.data['prism'], dim=0)
-        self.data['bui'] = torch.cat(self.data['bui'], dim=0)
-        self.data['ebird'] = torch.cat(self.data['ebird'], dim=0)
+        self.prism = torch.cat([x[0] for x in blocks])
+        self.bui   = torch.cat([x[1] for x in blocks])
+        self.ebird = torch.cat([x[2] for x in blocks])
 
     def __len__(self):
-        return self.data['prism'].shape[0]
+        return self.prism.shape[0]
 
     def __getitem__(self, idx):
-        return (self.data['prism'][idx], self.data['bui'][idx], self.data['ebird'][idx])
-
-# ----------------------
-# Dataset Normalization Module
-# ----------------------
-
-def normalize_dataset(train_dataset, val_dataset):
-    # --- BUI: power transform then standardize ---
-    bui_train = train_dataset.data['bui'] ** 0.1
-    mean_bui = bui_train.mean(0, keepdims=True)
-    std_bui = bui_train.std(0, keepdims=True)
-    train_dataset.data['bui'] = (bui_train - mean_bui) / (std_bui + 1e-6)
-    val_dataset.data['bui'] = ((val_dataset.data['bui'] ** 0.1) - mean_bui) / (std_bui + 1e-6)
+        return self.prism[idx], self.bui[idx], self.ebird[idx]
 
 
-    # --- eBird: sqrt transform then divide by number of species ---
-    # ebird_train = train_dataset.data['ebird'] ** 0.5
-    # n_species = ebird_train.shape[1]
-    # train_dataset.data['ebird'] = ebird_train / n_species
-    # val_dataset.data['ebird'] = (val_dataset.data['ebird'] ** 0.5) / n_species
-    ebird_train = train_dataset.data['ebird'] ** 0.5
-    scale = ebird_train.norm(dim=1).mean()
-    train_dataset.data['ebird'] = ebird_train / scale
-    val_dataset.data['ebird'] = (val_dataset.data['ebird'] ** 0.5) / scale
+# ============================================================
+# Normalization
+# ============================================================
 
-    # --- PRISM: standardize per band ---
-    prism_train = train_dataset.data['prism']
-    mean_prism = prism_train.mean(0, keepdims=True)
-    std_prism = prism_train.std(0, keepdims=True)
-    train_dataset.data['prism'] = (prism_train - mean_prism) / (std_prism + 1e-6)
-    val_dataset.data['prism'] = (val_dataset.data['prism'] - mean_prism) / (std_prism + 1e-6)
-    return train_dataset, val_dataset
+def normalize_dataset(train, val):
+    # --- PRISM ---
+    mu = train.prism.mean(0, keepdim=True)
+    sd = train.prism.std(0, keepdim=True)
+    train.prism = (train.prism - mu) / (sd + 1e-6)
+    val.prism   = (val.prism   - mu) / (sd + 1e-6)
 
-# ----------------------
-# B-MLP Block
-# ----------------------
+    # --- BUI ---
+    bui_train = train.bui ** 0.1
+    mu = bui_train.mean(0, keepdim=True)
+    sd = bui_train.std(0, keepdim=True)
+    train.bui = (bui_train - mu) / (sd + 1e-6)
+    val.bui   = ((val.bui ** 0.1) - mu) / (sd + 1e-6)
+
+    # --- eBird ---
+    e_train = train.ebird ** 0.5
+    scale = e_train.norm(dim=1).mean()
+    train.ebird = e_train / scale
+    val.ebird   = (val.ebird ** 0.5) / scale
+
+    return train, val
+
+
+# ============================================================
+# Model
+# ============================================================
 
 class BMLPBlock(nn.Module):
     def __init__(self, m, k=4, dropout=0.5):
         super().__init__()
-        self.layernorm = nn.LayerNorm(m)
-        self.expand = nn.Linear(m, m*k)
-        self.collapse = nn.Linear(m*k, m)
-        self.dropout = nn.Dropout(dropout)
+        self.ln = nn.LayerNorm(m)
+        self.fc1 = nn.Linear(m, m*k)
+        self.fc2 = nn.Linear(m*k, m)
+        self.drop = nn.Dropout(dropout)
 
     def forward(self, x):
-        z = self.layernorm(x)
-        z = self.expand(z)
-        z = F.gelu(z)
-        z = self.dropout(z)  # <-- dropout
-        z = self.collapse(z)
+        z = self.ln(x)
+        z = F.gelu(self.fc1(z))
+        z = self.drop(z)
+        z = self.fc2(z)
         return x + z
-    
-def add_input_noise(prism, bui, sigma_prism=0.01, sigma_bui=0.01):
-    prism_noisy = prism + sigma_prism * torch.randn_like(prism)
-    bui_noisy = bui + sigma_bui * torch.randn_like(bui)
-    return prism_noisy, bui_noisy
 
-
-# ----------------------
-# Autoencoder Model
-# ----------------------
 
 class MultiInputAutoencoder(nn.Module):
-    def __init__(self, prism_dim, bui_dim, latent_dim=16):
+    def __init__(self, prism_dim, bui_dim, latent_dim=6):
         super().__init__()
-        self.prism_encoder = nn.Sequential(
-            nn.Linear(prism_dim, latent_dim*4),   # reduce to intermediate dim
+        h = latent_dim * 4
+
+        self.prism_enc = nn.Sequential(
+            nn.Linear(prism_dim, h),
             nn.GELU(),
-            BMLPBlock(latent_dim*4),
-            BMLPBlock(latent_dim*4),
-            nn.GELU(),
+            BMLPBlock(h),
+            BMLPBlock(h),
         )
 
-        # -------------------
-        # BUI encoder
-        # -------------------
-        self.bui_encoder = nn.Sequential(
-            nn.Linear(bui_dim, latent_dim*4),   # reduce to intermediate dim
+        self.bui_enc = nn.Sequential(
+            nn.Linear(bui_dim, h),
             nn.GELU(),
-            BMLPBlock(latent_dim*4),
-            BMLPBlock(latent_dim*4),
-            nn.GELU(),
+            BMLPBlock(h),
+            BMLPBlock(h),
         )
-        
-        # mix_dim = prism_dim + bui_dim
-        mix_dim = latent_dim*8
+
         self.mixer = nn.Sequential(
-            nn.Linear(mix_dim, mix_dim),
+            nn.Linear(2*h, 2*h),
             nn.GELU(),
-            nn.Linear(mix_dim, latent_dim)
+            nn.Linear(2*h, latent_dim),
         )
+
         self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, mix_dim),
+            nn.Linear(latent_dim, 2*h),
             nn.GELU(),
-            nn.Linear(mix_dim, prism_dim + bui_dim)
+            nn.Linear(2*h, prism_dim + bui_dim),
         )
 
     def forward(self, prism, bui):
-        h_prism = self.prism_encoder(prism)
-        h_bui = self.bui_encoder(bui)
-        h = torch.cat([h_prism, h_bui], dim=1)
+        h = torch.cat([self.prism_enc(prism), self.bui_enc(bui)], dim=1)
         z = self.mixer(h)
-        recon = self.decoder(z)
-        return z, recon
-
-# ----------------------
-# Loss Functions
-# ----------------------
-
-def reconstruction_loss(recon, prism, bui):
-    target = torch.cat([prism, bui], dim=1)
-    return nn.MSELoss()(recon, target)
+        return z, self.decoder(z)
 
 
-def metric_loss(z, ebird):
-    dot_z = torch.sum(z[:-1] * z[1:], dim=1)
-    dot_ebird = torch.sum(ebird[:-1] * ebird[1:], dim=1)
-    return nn.MSELoss()(dot_z, dot_ebird)
+# ============================================================
+# Losses
+# ============================================================
 
-# ----------------------
-# Modified Metric Loss Preserving Latent Magnitude
-# ----------------------
+# def reconstruction_loss(recon, prism, bui):
+#     return F.mse_loss(recon, torch.cat([prism, bui], dim=1))
 
-# def metric_loss_preserve_kernel(z: torch.Tensor, eBird: torch.Tensor, lambda_norm: float = 1e-3):
-#     """
-#     Computes MSE between latent dot products and eBird dot products (all pairs),
-#     while regularizing latent norms to match the average eBird norm.
-    
-#     Args:
-#         z: latent embeddings (B x latent_dim)
-#         eBird: target abundance vectors (B x species_dim)
-#         lambda_norm: weight for latent norm regularization
-    
-#     Returns:
-#         loss: scalar, combined kernel MSE + latent norm regularization
-#     """
-#     # --- Dot-product kernel over all pairs ---
-#     z_dot = z @ z.T          # (B x B)
-#     e_dot = eBird @ eBird.T  # (B x B)
-
-#     # Kernel MSE
-#     kernel_mse = ((z_dot - e_dot) ** 2).mean()
-
-#     # --- Latent norm regularization ---
-#     target_norm = eBird.norm(dim=1).mean()
-#     latent_norm = z.norm(dim=1).mean()
-#     norm_loss = lambda_norm * (latent_norm - target_norm) ** 2
-
-#     # Combined loss
-#     loss = kernel_mse + norm_loss
-#     return loss
-
-def metric_loss_preserve_kernel(z: torch.Tensor, eBird: torch.Tensor, num_pairs: int = 16384, lambda_norm: float = 1e-3):
+def reconstruction_loss(recon: torch.Tensor, prism: torch.Tensor, bui: torch.Tensor, num_pairs: int = 16384):
     """
-    Vectorized MSE between latent and target dot products using random pairs,
-    with latent norm regularization. Fully GPU-friendly.
+    Dot-product–based reconstruction loss with optional random pairs.
+    Produces RMSE roughly O(1) by normalizing each vector pair.
 
     Args:
-        z: latent embeddings (B x latent_dim)
-        eBird: target abundance vectors (B x species_dim)
+        recon: model reconstruction (B x (prism_dim + bui_dim))
+        prism: original prism input (B x prism_dim)
+        bui: original bui input (B x bui_dim)
         num_pairs: number of random pairs to sample
-        lambda_norm: weight for latent norm regularization
 
     Returns:
-        loss: scalar, combined kernel MSE + latent norm regularization
+        loss: scalar tensor
     """
-    B = z.shape[0]
+    device = recon.device
+    target = torch.cat([prism, bui], dim=1)
+    B, D = target.shape
 
-    # Generate random pair indices
+    # Random pair indices
+    idx = torch.randint(0, B, (2, num_pairs), device=device)
+    i, j = idx[0], idx[1]
+
+    # Gather pairs
+    recon_i, recon_j = recon[i], recon[j]
+    target_i, target_j = target[i], target[j]
+
+    # Normalize each vector to unit norm to bound dot products
+    recon_i_norm = F.normalize(recon_i, p=2, dim=1)
+    recon_j_norm = F.normalize(recon_j, p=2, dim=1)
+    target_i_norm = F.normalize(target_i, p=2, dim=1)
+    target_j_norm = F.normalize(target_j, p=2, dim=1)
+
+    # Pairwise dot products
+    dot_recon = torch.sum(recon_i_norm * recon_j_norm, dim=1)
+    dot_target = torch.sum(target_i_norm * target_j_norm, dim=1)
+
+    # MSE over sampled pairs
+    loss = torch.mean((dot_recon - dot_target) ** 2)
+    return loss
+
+
+
+def metric_loss_preserve_kernel(z, eBird, num_pairs=16384, lambda_norm=1e-3):
+    B = z.shape[0]
     idx = torch.randint(0, B, (2, num_pairs), device=z.device)
     i, j = idx[0], idx[1]
 
-    # Compute dot products using gathered indices (vectorized)
-    dot_z = torch.sum(z[i] * z[j], dim=1)
-    dot_e = torch.sum(eBird[i] * eBird[j], dim=1)
+    dot_z = (z[i] * z[j]).sum(dim=1)
+    dot_e = (eBird[i] * eBird[j]).sum(dim=1)
 
-    # Kernel MSE
-    kernel_mse = torch.mean((dot_z - dot_e) ** 2)
+    kernel_mse = ((dot_z - dot_e) ** 2).mean()
 
-    # Latent norm regularization
-    target_norm = eBird.norm(dim=1).mean()
-    latent_norm = z.norm(dim=1).mean()
-    norm_loss = lambda_norm * (latent_norm - target_norm) ** 2
+    # per-sample norm alignment (BLR-critical)
+    norm_loss = ((z.norm(dim=1) - eBird.norm(dim=1)) ** 2).mean()
 
-    return kernel_mse + norm_loss
+    return kernel_mse + lambda_norm * norm_loss
 
 
-# ----------------------
-# Training Loop
-# ----------------------
+# ============================================================
+# Validation metrics
+# ============================================================
 
-# ----------------------
-# Interpret Metric Loss and Cosine Similarity
-# ----------------------
-
-def interpret_metric_loss(z, ebird, sample_size=1000):
-    N = z.shape[0]
-    if N > sample_size:
-        idx = torch.randperm(N)[:sample_size]
-        z_sample = z[idx]
-        ebird_sample = ebird[idx]
-    else:
-        z_sample = z
-        ebird_sample = ebird
-
-    dot_z = torch.sum(z_sample[:-1] * z_sample[1:], dim=1)
-    dot_ebird = torch.sum(ebird_sample[:-1] * ebird_sample[1:], dim=1)
-    mse = torch.mean((dot_z - dot_ebird) ** 2).item()
-    avg_dot_z = dot_z.mean().item()
-    avg_dot_ebird = dot_ebird.mean().item()
-
-    # Cosine similarity
-    z_norm = z_sample / (z_sample.norm(dim=1, keepdim=True) + 1e-8)
-    ebird_norm = ebird_sample / (ebird_sample.norm(dim=1, keepdim=True) + 1e-8)
-    cos_z = torch.sum(z_norm[:-1] * z_norm[1:], dim=1).mean().item()
-    cos_ebird = torch.sum(ebird_norm[:-1] * ebird_norm[1:], dim=1).mean().item()
-
-    return avg_dot_z, avg_dot_ebird, mse, cos_z, cos_ebird
-
-
-def compute_composite_metric(z: torch.Tensor, eBird: torch.Tensor, alpha: float = 0.5, beta: float = 0.5):
+@torch.no_grad()
+def compute_kernel_diagnostics(
+    z: torch.Tensor,
+    eBird: torch.Tensor,
+    max_pairs: int = 512,
+):
     """
-    Computes a composite validation metric preserving the dot-product kernel,
-    using RMSE for interpretability, and also logs directional alignment.
+    Comprehensive kernel diagnostics for validation / logging.
+    Does NOT affect training. Uses subsampling to control cost.
 
     Args:
-        z (torch.Tensor): Latent embeddings (B x latent_dim)
-        eBird (torch.Tensor): Target abundance vectors (B x species_dim)
-        alpha (float): Weight for kernel RMSE component
-        beta (float): Weight for directional alignment (cosine similarity)
-    
+        z: latent embeddings (B x latent_dim)
+        eBird: abundance vectors (B x species_dim)
+        max_pairs: number of samples used for kernel diagnostics
+
     Returns:
-        composite: float, weighted combination for logging (not used for training)
-        kernel_rmse_norm: float, normalized kernel RMSE
-        cos_sim_mean: float, mean pairwise cosine similarity of directions
+        dict of diagnostic scalars
     """
     B = z.shape[0]
+    device = z.device
 
-    # --- Raw dot-product kernels ---
-    z_dot = z @ z.T              # (B x B)
-    e_dot = eBird @ eBird.T      # (B x B)
+    # --- Subsample ---
+    if B > max_pairs:
+        idx = torch.randperm(B, device=device)[:max_pairs]
+        z_s = z[idx]
+        e_s = eBird[idx]
+    else:
+        z_s = z
+        e_s = eBird
 
-    # Kernel RMSE over all pairs
-    kernel_mse = ((z_dot - e_dot) ** 2).mean()
+    # --- Dot-product kernels ---
+    Kz = z_s @ z_s.T
+    Ke = e_s @ e_s.T
+
+    # --- Kernel RMSE ---
+    kernel_mse = ((Kz - Ke) ** 2).mean()
     kernel_rmse = torch.sqrt(kernel_mse)
 
-    # Normalized RMSE for logging
-    e_dot_rmse = torch.sqrt((e_dot ** 2).mean())
-    kernel_rmse_norm = kernel_rmse / e_dot_rmse  # dimensionless, interpretable
+    # --- Normalized kernel RMSE ---
+    ke_scale = torch.sqrt((Ke ** 2).mean())
+    kernel_rmse_norm = kernel_rmse / (ke_scale + 1e-8)
 
-    # --- Directional alignment (cosine similarity) ---
-    z_norm = F.normalize(z, p=2, dim=1)
-    e_norm = F.normalize(eBird, p=2, dim=1)
-    cos_sim_matrix = (z_norm @ z_norm.T) * (e_norm @ e_norm.T)
+    # --- Directional alignment ---
+    z_normed = F.normalize(z_s, dim=1)
+    e_normed = F.normalize(e_s, dim=1)
+    cos_sim_matrix = (z_normed @ z_normed.T) * (e_normed @ e_normed.T)
     cos_sim_mean = cos_sim_matrix.mean()
 
-    # cos_sim_mean = F.cosine_similarity(z, eBird, dim=1).mean()
+    # --- Latent norm statistics ---
+    z_norm = z_s.norm(dim=1)
+    z_norm_mean = z_norm.mean()
+    z_norm_std = z_norm.std()
 
-    # --- Composite metric for logging ---
-    composite = alpha * kernel_rmse_norm + beta * (1 - cos_sim_mean)
+    # --- Kernel magnitude diagnostics ---
+    Kz_diag = torch.diag(Kz)
+    Ke_diag = torch.diag(Ke)
 
-    return composite.item(), kernel_rmse_norm.item(), cos_sim_mean.item()
+    Kz_off = Kz[~torch.eye(Kz.size(0), dtype=bool, device=device)]
+    Ke_off = Ke[~torch.eye(Ke.size(0), dtype=bool, device=device)]
 
-# ----------------------
-# Updated Training Loop with Interpretable Metric
-# ----------------------
+    # --- Effective rank (geometry collapse check) ---
+    # small batch SVD is cheap at max_pairs ~ 512
+    svals = torch.linalg.svdvals(z_s)
+    eff_rank = (svals / svals.sum()).pow(2).sum().reciprocal()
 
-# ----------------------
-# Updated Training Loop with Training and Validation Losses + Interpretable Metrics
-# ----------------------
+    return {
+        # Core kernel metrics
+        "kernel_rmse": kernel_rmse.item(),
+        "kernel_rmse_norm": kernel_rmse_norm.item(),
+        "cos_sim_mean": cos_sim_mean.item(),
 
-def train_model(train_dataset, val_dataset, prism_dim, bui_dim, latent_dim=16, batch_size=16384, epochs=50, lr=1e-2):
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # Latent scale
+        "z_norm_mean": z_norm_mean.item(),
+        "z_norm_std": z_norm_std.item(),
+
+        # Kernel magnitude
+        "Kz_diag_mean": Kz_diag.mean().item(),
+        "Ke_diag_mean": Ke_diag.mean().item(),
+        "Kz_off_mean": Kz_off.mean().item(),
+        "Ke_off_mean": Ke_off.mean().item(),
+
+        # Geometry
+        "latent_eff_rank": eff_rank.item(),
+    }
+
+
+# ============================================================
+# Training
+# ============================================================
+
+def train_model(train, val, prism_dim, bui_dim, latent_dim=6,
+                batch_size=16384, epochs=100, lr=1e-2):
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     model = MultiInputAutoencoder(prism_dim, bui_dim, latent_dim).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    loader = DataLoader(train, batch_size=batch_size, shuffle=True)
 
-    for epoch in range(1, epochs+1):
+    for ep in range(1, epochs+1):
         model.train()
-        train_recon_loss = 0.0
-        train_metric_loss = 0.0
-        n_batches = 0
-
-        for prism, bui, ebird in train_loader:
-            prism = prism.to(device)
-            bui = bui.to(device)
-            ebird = ebird.to(device)
-
-            # Optional input augmentation
-            prism, bui = add_input_noise(prism, bui)
-
-            optimizer.zero_grad()
-            z, recon = model(prism, bui)
-            loss_recon = reconstruction_loss(recon, prism, bui)
-            loss_metric = metric_loss_preserve_kernel(z, ebird)
-            loss = loss_recon + loss_metric
+        for p, b, e in loader:
+            p, b, e = p.to(device), b.to(device), e.to(device)
+            opt.zero_grad()
+            z, recon = model(p, b)
+            loss = reconstruction_loss(recon, p, b) + metric_loss_preserve_kernel(z, e)
             loss.backward()
-            optimizer.step()
+            opt.step()
 
-            train_recon_loss += loss_recon.item()
-            train_metric_loss += loss_metric.item()
-            n_batches += 1
-
-        train_recon_loss /= n_batches
-        train_metric_loss /= n_batches
-
-        # ----------------------
-        # Validation evaluation
-        # ----------------------
         model.eval()
         with torch.no_grad():
-            val_prism = val_dataset.data['prism'].to(device)
-            val_bui = val_dataset.data['bui'].to(device)
-            val_ebird = val_dataset.data['ebird'].to(device)
+            # Move validation data to device
+            prism_v = val.prism.to(device)
+            bui_v   = val.bui.to(device)
+            ebird_v = val.ebird.to(device)
 
-            z_val, recon_val = model(val_prism, val_bui)
-            recon_loss_val = reconstruction_loss(recon_val, val_prism, val_bui).item()
-            metric_loss_val = metric_loss_preserve_kernel(z_val, val_ebird).item()
+            # Forward pass
+            z, recon = model(prism_v, bui_v)
 
-            # Compute combined latent alignment metrics
-            composite, kernel_rmse, cos_sim_mean = compute_composite_metric(z_val, val_ebird)
+            # Core validation losses
+            val_recon_loss  = reconstruction_loss(recon, prism_v, bui_v).item()
+            val_metric_loss = metric_loss_preserve_kernel(z, ebird_v, num_pairs=8192, lambda_norm=0.0).item()
+
+            # --- Kernel diagnostics ---
+            diagnostics = compute_kernel_diagnostics(z, ebird_v, max_pairs=512)
+
+        # Print everything in one clean line
+        print(
+            f"Epoch {ep}: "
+            f"ValRecon={val_recon_loss:.6f}, "
+            f"ValMetric={val_metric_loss:.6f}, "
+            f"KernelRMSE={diagnostics['kernel_rmse']:.6f}, "
+            f"KernelRMSENorm={diagnostics['kernel_rmse_norm']:.6f}, "
+            f"CosSimMean={diagnostics['cos_sim_mean']:.6f}, "
+            f"ZNormMean={diagnostics['z_norm_mean']:.4f}, "
+            f"ZNormStd={diagnostics['z_norm_std']:.4f}, "
+            f"KzDiagMean={diagnostics['Kz_diag_mean']:.4f}, "
+            f"KeDiagMean={diagnostics['Ke_diag_mean']:.4f}, "
+            f"KzOffMean={diagnostics['Kz_off_mean']:.4f}, "
+            f"KeOffMean={diagnostics['Ke_off_mean']:.4f}, "
+            f"LatentEffRank={diagnostics['latent_eff_rank']:.4f}"
+        )
 
 
-        print(f"Epoch {epoch}: Train Recon={train_recon_loss:.6f}, Train Metric={train_metric_loss:.6f}, "
-            f"Val Recon={recon_loss_val:.6f}, Val Metric={metric_loss_val:.6f}, "
-            f"KernelRMSE={kernel_rmse:.6f}, CosSimMean={cos_sim_mean:.6f}, "
-            f"CompositeMetric={composite:.6f}")
+# ============================================================
+# Main
+# ============================================================
 
+if __name__ == "__main__":
+    prism = load_tifs("/home/breallis/datasets/prism_monthly_4km_albers", "prism_*_2023*.tif")
+    bui   = load_tifs("/home/breallis/datasets/HBUI/BUI_4km_interp", "2020_BUI_4km_interp.tif")
+    ebird = load_tifs("/home/breallis/datasets/ebird_weekly_2023_albers", "whcspa_abundance_median_2023-*.tif")
 
-# ----------------------
-# Example Usage
-# ----------------------
+    ebird_mask, ebird = mask_ebird(ebird)
 
-if __name__ == '__main__':
-    prism_array = load_tifs('/home/breallis/datasets/prism_monthly_4km_albers', 'prism_*_2023*.tif')
-    bui_array = load_tifs('/home/breallis/datasets/HBUI/BUI_4km_interp', '2020_BUI_4km_interp.tif')
-    ebird_array = load_tifs('/home/breallis/datasets/ebird_weekly_2023_albers', 'whcspa_abundance_median_2023-*.tif')
+    # prism = add_spatial_context(prism)
+    # bui   = add_spatial_context(bui)
 
-    prism_mask = mask_prism(prism_array)
-    bui_mask = mask_bui(bui_array)
-    ebird_mask, ebird_array = mask_ebird(ebird_array)
+    train = PixelDataset(prism, bui, ebird, split="train")
+    val   = PixelDataset(prism, bui, ebird, split="val")
 
-    valid_mask = prism_mask & bui_mask & ebird_mask
+    train, val = normalize_dataset(train, val)
 
-    train_dataset = PixelDataset(prism_array, bui_array, ebird_array, block_rows=8, block_cols=8, split='train')
-    val_dataset = PixelDataset(prism_array, bui_array, ebird_array, block_rows=8, block_cols=8, split='val')
-
-    # --- Apply normalization ---
-    train_dataset, val_dataset = normalize_dataset(train_dataset, val_dataset)
-
-    train_model(train_dataset, val_dataset, prism_dim=prism_array.shape[-1], bui_dim=bui_array.shape[-1], latent_dim=6)
+    train_model(
+        train, val,
+        prism_dim=train.prism.shape[1],
+        bui_dim=train.bui.shape[1],
+        latent_dim=6,
+    )
