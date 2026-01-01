@@ -1,547 +1,387 @@
 import os
 import glob
+import re
 import numpy as np
+import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader
-from scipy.ndimage import gaussian_filter1d
-import torch.nn.functional as F
+from datetime import datetime
 import matplotlib.pyplot as plt
+from scipy.ndimage import gaussian_filter1d
+import rasterio
 
 # ============================================================
-# Spatial smoothing utilities
+# 1. Robust Data Loader (Species-Major Order)
 # ============================================================
+def load_tifs_structured(folder, pattern="*_abundance_median_*.tif"):
+    """
+    Parses filenames to enforce strict (Species, Time) ordering.
+    Returns: stack (H, W, S*T), meta dict
+    """
+    files = sorted(glob.glob(os.path.join(folder, pattern)))
+    if not files:
+        raise ValueError(f"No files found in {folder} matching {pattern}")
 
-def nan_aware_gaussian(X, sigma):
-    mask = np.isfinite(X).astype(np.float32)
-    X = np.nan_to_num(X, nan=0.0)
+    # Regex captures <species> and <date>
+    regex = re.compile(r"([a-z0-9]+)_abundance_median_(\d{4}-\d{2}-\d{2})")
+    records = []
+    for fpath in files:
+        fname = os.path.basename(fpath)
+        match = regex.match(fname)
+        if match:
+            records.append({
+                "species": match.group(1),
+                "date": datetime.strptime(match.group(2), "%Y-%m-%d"),
+                "path": fpath
+            })
+        else:
+            print(f"Skipping non-matching file: {fname}")
 
-    num = gaussian_filter1d(X * mask, sigma, axis=0, mode="constant")
-    num = gaussian_filter1d(num, sigma, axis=1, mode="constant")
-    den = gaussian_filter1d(mask, sigma, axis=0, mode="constant")
-    den = gaussian_filter1d(den, sigma=1, mode="constant")
+    df = pd.DataFrame(records)
+    if df.empty: raise ValueError("No filenames matched regex.")
+    
+    # Validation: Ensure grid is complete
+    n_species = df['species'].nunique()
+    n_weeks = df['date'].nunique()
+    if len(df) != n_species * n_weeks:
+        raise ValueError(f"Grid incomplete. Expected {n_species*n_weeks} files, found {len(df)}.")
 
-    out = num / (den + 1e-6)
-    out[den < 1e-6] = np.nan
-    return out
-
-# ============================================================
-# Dataset loader
-# ============================================================
-
-def load_tifs(folder, pattern):
-    paths = sorted(glob.glob(os.path.join(folder, pattern)))
-    arrays = []
-    for p in paths:
-        import rasterio
+    # Sort -> Species Major: Species 1 [Week 1..52], Species 2 [Week 1..52]...
+    df_sorted = df.sort_values(by=['species', 'date'])
+    ordered_paths = df_sorted['path'].tolist()
+    
+    # Load first file to get dimensions
+    with rasterio.open(ordered_paths[0]) as src:
+        H, W = src.shape
+        
+    print(f"Loading {len(ordered_paths)} rasters ({n_species} sp x {n_weeks} wks)...")
+    
+    # Pre-allocate stack
+    full_stack = np.zeros((H, W, len(ordered_paths)), dtype=np.float32)
+    
+    for i, p in enumerate(ordered_paths):
         with rasterio.open(p) as src:
-            data = src.read()  # (bands, H, W)
-            data = np.moveaxis(data, 0, -1)  # (H, W, bands)
-            arrays.append(data.astype(np.float32))
-    if not arrays:
-        raise ValueError(f"No files found: {folder}/{pattern}")
-    return np.concatenate(arrays, axis=-1)
+            full_stack[:, :, i] = src.read(1)
 
-
-def mask_ebird(ebird_array):
-    valid = np.any(~np.isnan(ebird_array), axis=-1)
-    return valid, np.nan_to_num(ebird_array, nan=0.0)
-
+    return full_stack, {"n_species": n_species, "n_weeks": n_weeks}
 
 # ============================================================
-# Modified Nyström Function for Rational Quadratic Kernel
+# 2. Smoothed Hellinger Transform
 # ============================================================
-
-def compute_optimal_latent_z_rq(
-    ebird_flat: np.ndarray,
-    latent_dim: int = 6,
-    n_landmarks: int = 5000,
-    block_size: int = 250_000,
-    lengthscale: float = 1.0,
-    alpha: float = 0.1, 
-    seed: int = 42,
-):
+def smoothed_hellinger_transform(ebird_flat, n_weeks, sigma):
     """
-    Nyström approximation using the Rational Quadratic (RQ) Kernel.
-    
-    k(x, y) = (1 + ||x-y||^2 / (2 * alpha * lengthscale^2))^(-alpha)
+    1. Reshapes to (N, Species, Weeks)
+    2. Applies Gaussian blur along Time axis (if sigma > 0)
+    3. Reflattens and applies Hellinger Transform
     """
-    np.random.seed(seed)
     N, D = ebird_flat.shape
-
-    # --- Landmark selection ---
-    if N <= n_landmarks:
-        idx_lm = np.arange(N)
+    n_species = D // n_weeks
+    
+    # Reshape: N x Species x Weeks
+    data_3d = ebird_flat.reshape(N, n_species, n_weeks)
+    
+    if sigma > 1e-5:
+        # mode='wrap' assumes the yearly cycle connects Week 52 -> Week 1
+        data_smoothed = gaussian_filter1d(data_3d, sigma=sigma, axis=-1, mode='wrap')
     else:
-        # Check if we accidentally pass the whole array instead of valid pixels
-        if N > 1_000_000 and n_landmarks > 20_000: 
-             print("Warning: Large N and large landmarks. Ensure memory is sufficient.")
-        idx_lm = np.random.choice(N, n_landmarks, replace=False)
-
-    X_lm = ebird_flat[idx_lm]  # (M x D)
-    M = X_lm.shape[0]
-
-    # --- Landmark RQ kernel ---
-    # Squared Euclidean distances
-    sq_dists_mm = (
-        np.sum(X_lm**2, axis=1)[:, None]
-        + np.sum(X_lm**2, axis=1)[None, :]
-        - 2 * (X_lm @ X_lm.T)
-    )
-    # Ensure non-negative distances due to float errors
-    sq_dists_mm = np.maximum(sq_dists_mm, 0.0) 
-
-    # RQ Formula: (1 + r^2 / (2*alpha*l^2))^(-alpha)
-    base_mm = 1.0 + sq_dists_mm / (2.0 * alpha * lengthscale**2)
-    K_mm = np.power(base_mm, -alpha)
-
-    # --- Eigendecomposition (PSD-safe) ---
-    eigvals, eigvecs = np.linalg.eigh(K_mm)
-    idx = np.argsort(eigvals)[::-1]
+        data_smoothed = data_3d
+        
+    # Flatten back to N x D
+    data_flat = data_smoothed.reshape(N, -1)
     
-    # Filter eigenvalues < 1e-10 to avoid exploding S_inv
-    eigvals = eigvals[idx]
-    eigvecs = eigvecs[:, idx]
-    
-    # Selecting top k
-    eigvals_k = eigvals[:latent_dim]
-    eigvecs_k = eigvecs[:, :latent_dim]
-    
-    # Numerical guard: if top eigenvalues are tiny, RQ might be too flat
-    if eigvals_k[-1] < 1e-12:
-        print(f"Warning: Eigenvalue collapse. Min top-{latent_dim} eigval: {eigvals_k[-1]}")
+    # Hellinger: sqrt( x / sum(x) )
+    row_sums = data_flat.sum(axis=1, keepdims=True)
+    row_sums[row_sums < 1e-9] = 1.0  # Avoid div/0
+    return np.sqrt(data_flat / row_sums)
 
-    U_k = eigvecs_k
-    S_inv_sqrt = np.diag(1.0 / np.sqrt(np.clip(eigvals_k, 1e-12, None)))
+# ============================================================
+# 3. RQ Kernel Nyström
+# ============================================================
+# def compute_optimal_latent_z_rq(ebird_flat, latent_dim, lengthscale, alpha, n_landmarks=5000, seed=42):
+#     np.random.seed(seed)
+#     N = ebird_flat.shape[0]
+    
+#     # Select Landmarks
+#     idx_lm = np.random.choice(N, min(N, n_landmarks), replace=False)
+#     X_lm = ebird_flat[idx_lm]
 
-    # --- Allocate output ---
+#     # Helper: pairwise squared distances
+#     def get_sq_dists(A, B):
+#         # (A-B)^2 = A^2 + B^2 - 2AB
+#         return np.maximum(
+#             np.sum(A**2, axis=1)[:,None] + np.sum(B**2, axis=1)[None,:] - 2*(A@B.T), 
+#             0.0
+#         )
+
+#     # Landmark Kernel K_mm
+#     sq_dists_mm = get_sq_dists(X_lm, X_lm)
+#     base_mm = 1.0 + sq_dists_mm / (2.0 * alpha * lengthscale**2)
+#     K_mm = np.power(base_mm, -alpha)
+
+#     # Eigendecomposition
+#     eigvals, eigvecs = np.linalg.eigh(K_mm)
+#     idx = np.argsort(eigvals)[::-1]
+#     eigvals = eigvals[idx][:latent_dim]
+#     eigvecs = eigvecs[:, idx][:, :latent_dim]
+    
+#     # Nyström Projection Matrix
+#     U_k = eigvecs
+#     S_inv_sqrt = np.diag(1.0 / np.sqrt(np.clip(eigvals, 1e-12, None)))
+    
+#     # Blocked Projection of all points
+#     block_size = 50000
+#     Z_opt = np.zeros((N, latent_dim), dtype=np.float32)
+    
+#     for start in range(0, N, block_size):
+#         end = min(start + block_size, N)
+#         X_blk = ebird_flat[start:end]
+        
+#         sq_dists_blk = get_sq_dists(X_blk, X_lm)
+#         base_blk = 1.0 + sq_dists_blk / (2.0 * alpha * lengthscale**2)
+#         K_blk = np.power(base_blk, -alpha)
+        
+#         Z_opt[start:end] = (K_blk @ U_k @ S_inv_sqrt).astype(np.float32)
+        
+#     return Z_opt
+
+def compute_optimal_latent_z_rq(ebird_flat, latent_dim, lengthscale, alpha, n_landmarks=20000, device='cuda'):
+    """
+    Scaled Nystrom for large landmark sets (M=20,000+).
+    Uses Torch for accelerated distance calcs and batching.
+    """
+    import torch
+    N, D = ebird_flat.shape
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # 1. Select Landmarks
+    idx_lm = np.random.choice(N, min(N, n_landmarks), replace=False)
+    X_lm = torch.tensor(ebird_flat[idx_lm], device=device, dtype=torch.float32)
+
+    # 2. Compute K_mm (Landmark-to-Landmark)
+    # Using (A-B)^2 = A^2 + B^2 - 2AB in torch
+    with torch.no_grad():
+        dist_sq = torch.cdist(X_lm, X_lm, p=2)**2
+        K_mm = (1.0 + dist_sq / (2.0 * alpha * lengthscale**2)).pow(-alpha)
+        
+        # Eigen-decomposition (Small enough for CPU/GPU)
+        # Using .cpu() for the solver often more stable for large M
+        L, U = torch.linalg.eigh(K_mm.cpu()) 
+        
+        # Sort descending
+        idx = torch.argsort(L, descending=True)[:latent_dim]
+        L = L[idx]
+        U = U[:, idx].to(device)
+        
+        # SVD Projection Matrix: U * S^-0.5
+        proj_mat = U / torch.sqrt(torch.clamp(L.to(device), min=1e-10))
+
+    # 3. Batch Projection (The "Memory Guard")
+    # Project all N points in chunks to avoid OOM
     Z_opt = np.zeros((N, latent_dim), dtype=np.float32)
-
-    # --- Blocked projection ---
-    for start in range(0, N, block_size):
-        end = min(start + block_size, N)
-        X_blk = ebird_flat[start:end]
-
-        # Squared distances between block and landmarks
-        sq_dists_blk = (
-            np.sum(X_blk**2, axis=1)[:, None]
-            + np.sum(X_lm**2, axis=1)[None, :]
-            - 2 * (X_blk @ X_lm.T)
-        )
-        sq_dists_blk = np.maximum(sq_dists_blk, 0.0)
-
-        # RQ Kernel calculation
-        base_blk = 1.0 + sq_dists_blk / (2.0 * alpha * lengthscale**2)
-        K_blk = np.power(base_blk, -alpha)
-
-        # Project
-        Z_blk = K_blk @ U_k @ S_inv_sqrt
-        Z_opt[start:end] = Z_blk.astype(np.float32)
-
-        del X_blk, sq_dists_blk, base_blk, K_blk, Z_blk
-
+    batch_size = 10000 
+    
+    with torch.no_grad():
+        for start in range(0, N, batch_size):
+            end = min(start + batch_size, N)
+            X_batch = torch.tensor(ebird_flat[start:end], device=device, dtype=torch.float32)
+            
+            # Distance from batch to landmarks
+            d_batch_lm = torch.cdist(X_batch, X_lm, p=2)**2
+            K_batch_lm = (1.0 + d_batch_lm / (2.0 * alpha * lengthscale**2)).pow(-alpha)
+            
+            # Project: (Batch x M) @ (M x Latent_dim)
+            Z_opt[start:end] = (K_batch_lm @ proj_mat).cpu().numpy()
+            
     return Z_opt
 
-def compute_optimal_latent_z_rbf(
-    ebird_flat: np.ndarray,
-    latent_dim: int = 6,
-    n_landmarks: int = 5000,
-    block_size: int = 250_000,
-    lengthscale: float = 1.0,
-    seed: int = 42,
-):
-    """
-    Memory-efficient Nyström approximation of RBF kernel latent embedding.
-
-    Args:
-        ebird_flat: (N x S) Hellinger-transformed pseudo-species matrix
-        latent_dim: desired latent dimensionality
-        n_landmarks: number of Nyström landmarks
-        block_size: number of pixels per block
-        lengthscale: RBF lengthscale (ell)
-        seed: RNG seed
-
-    Returns:
-        Z_opt: (N x latent_dim) optimal latent embedding approximating RBF similarity
-    """
-    np.random.seed(seed)
-    N, D = ebird_flat.shape
-
-    # --- Landmark selection ---
-    if N <= n_landmarks:
-        idx_lm = np.arange(N)
-    else:
-        idx_lm = np.random.choice(N, n_landmarks, replace=False)
-
-    X_lm = ebird_flat[idx_lm]  # (M x D)
-    M = X_lm.shape[0]
-
-    # --- Landmark RBF kernel ---
-    # Efficient pairwise squared distances
-    sq_dists = (
-        np.sum(X_lm**2, axis=1)[:, None]
-        + np.sum(X_lm**2, axis=1)[None, :]
-        - 2 * (X_lm @ X_lm.T)
-    )
-    K_mm = np.exp(-sq_dists / (2 * lengthscale**2))
-
-    # --- Eigendecomposition (PSD-safe) ---
-    eigvals, eigvecs = np.linalg.eigh(K_mm)
-    idx = np.argsort(eigvals)[::-1]
-    eigvals = np.clip(eigvals[idx], 1e-10, None)  # numerical stability
-    eigvecs = eigvecs[:, idx]
-
-    U_k = eigvecs[:, :latent_dim]                      # (M x k)
-    S_inv_sqrt = np.diag(1.0 / np.sqrt(eigvals[:latent_dim]))  # (k x k)
-
-    # --- Allocate output ---
-    Z_opt = np.zeros((N, latent_dim), dtype=np.float32)
-
-    # --- Blocked projection ---
-    for start in range(0, N, block_size):
-        end = min(start + block_size, N)
-        X_blk = ebird_flat[start:end]  # (B x D)
-
-        # Compute RBF between block and landmarks
-        sq_dists_blk = (
-            np.sum(X_blk**2, axis=1)[:, None]
-            + np.sum(X_lm**2, axis=1)[None, :]
-            - 2 * (X_blk @ X_lm.T)
-        )
-        K_blk = np.exp(-sq_dists_blk / (2 * lengthscale**2))  # (B x M)
-
-        # Project
-        Z_blk = K_blk @ U_k @ S_inv_sqrt
-        Z_opt[start:end] = Z_blk.astype(np.float32)
-
-        # Cleanup
-        del X_blk, sq_dists_blk, K_blk, Z_blk
-
-    return Z_opt
-
-def compute_optimal_latent_z(
-    ebird_flat: np.ndarray,
-    latent_dim: int = 6,
-    n_landmarks: int = 5000,
-    block_size: int = 250_000,
-    seed: int = 42,
-):
-    """
-    Memory-safe SVD–Nyström optimal latent embedding.
-
-    Computes Z = K_nm U Λ^{-1/2} in blocks, never materializing K_nm.
-
-    Args:
-        ebird_flat: (N x S) Hellinger-transformed pseudo-species matrix
-        latent_dim: desired latent dimensionality
-        n_landmarks: Nyström landmarks
-        block_size: number of pixels per projection block
-        seed: RNG seed
-
-    Returns:
-        Z_opt: (N x latent_dim) optimal latent embedding
-    """
-    np.random.seed(seed)
-    N, D = ebird_flat.shape
-
-    # --- Landmark selection ---
-    if N <= n_landmarks:
-        idx_lm = np.arange(N)
-    else:
-        idx_lm = np.random.choice(N, n_landmarks, replace=False)
-
-    X_lm = ebird_flat[idx_lm]  # (M x D)
-    M = X_lm.shape[0]
-
-    # --- Landmark kernel ---
-    K_mm = X_lm @ X_lm.T  # (M x M)
-
-    # --- Eigendecomposition (PSD-safe) ---
-    eigvals, eigvecs = np.linalg.eigh(K_mm)
-
-    # Sort descending
-    idx = np.argsort(eigvals)[::-1]
-    eigvals = eigvals[idx]
-    eigvecs = eigvecs[:, idx]
-
-    # Clip for numerical stability
-    eigvals = np.clip(eigvals, 1e-10, None)
-
-    # Truncate to latent_dim
-    U_k = eigvecs[:, :latent_dim]                      # (M x k)
-    S_inv_sqrt = np.diag(1.0 / np.sqrt(eigvals[:latent_dim]))  # (k x k)
-
-    # --- Allocate output ---
-    Z_opt = np.zeros((N, latent_dim), dtype=np.float32)
-
-    # --- Blocked projection ---
-    for start in range(0, N, block_size):
-        end = min(start + block_size, N)
-        X_blk = ebird_flat[start:end]          # (B x D)
-
-        # K_nm block = X_blk @ X_lm.T
-        K_blk = X_blk @ X_lm.T                  # (B x M)
-
-        # Project
-        Z_blk = K_blk @ U_k @ S_inv_sqrt         # (B x k)
-
-        Z_opt[start:end] = Z_blk.astype(np.float32)
-
-        # Explicit cleanup (WSL-critical)
-        del X_blk, K_blk, Z_blk
-
-    return Z_opt
-
-def hellinger_transform(ebird_flat):
-    """
-    Hellinger transform of abundance matrix.
+def compute_kernel_diagnostics(z, eBird, max_samples=1000):
+    idx = np.random.choice(z.shape[0], min(z.shape[0], max_samples), replace=False)
+    z_s, e_s = torch.tensor(z[idx]), torch.tensor(eBird[idx])
     
-    Args:
-        ebird_flat: (N x S) abundance matrix, one row per pixel, one column per species/week
-
-    Returns:
-        Hellinger-transformed array of same shape
-    """
-    row_sums = ebird_flat.sum(axis=1, keepdims=True)
-    # Avoid division by zero
-    row_sums[row_sums == 0] = 1.0
-    return np.sqrt(ebird_flat / row_sums)
-
-
-def estimate_rbf_lengthscale(ebird_flat: np.ndarray, n_samples: int = 5000, quantile: float = 0.1, seed: int = 42) -> float:
-    """
-    Estimate a sensible RBF lengthscale for Nyström kernel projection.
-
-    Args:
-        ebird_flat: (N x S) Hellinger-transformed pseudo-species matrix
-        n_samples: number of pixels to sample for distance estimation
-        quantile: which quantile of pairwise distances to use (0.5 = median)
-        seed: RNG seed
-
-    Returns:
-        float: recommended RBF lengthscale
-    """
-    np.random.seed(seed)
-    N = ebird_flat.shape[0]
-
-    # Sample pixels
-    if N <= n_samples:
-        X_sample = ebird_flat
-    else:
-        idx = np.random.choice(N, n_samples, replace=False)
-        X_sample = ebird_flat[idx]
-
-    # Compute squared pairwise distances
-    sq_dists = (
-        np.sum(X_sample**2, axis=1)[:, None]
-        + np.sum(X_sample**2, axis=1)[None, :]
-        - 2 * (X_sample @ X_sample.T)
-    )
-
-    # Take only upper triangle to avoid duplicates and diagonal
-    triu_idx = np.triu_indices_from(sq_dists, k=1)
-    sq_dists_vec = sq_dists[triu_idx]
-
-    # Lengthscale as sqrt of chosen quantile distance
-    lengthscale = np.sqrt(np.quantile(sq_dists_vec, quantile))
-
-    return float(lengthscale)
-
-
-# ============================================================
-# Kernel diagnostics
-# ============================================================
-
-def compute_kernel_diagnostics(z: np.ndarray, eBird: np.ndarray, max_pairs: int = 512):
-    B = z.shape[0]
-
-    if B > max_pairs:
-        idx = np.random.choice(B, max_pairs, replace=False)
-        z_s = torch.tensor(z[idx], dtype=torch.float32)
-        e_s = torch.tensor(eBird[idx], dtype=torch.float32)
-    else:
-        z_s = torch.tensor(z, dtype=torch.float32)
-        e_s = torch.tensor(eBird, dtype=torch.float32)
-
-    # Dot-product kernels
+    # RMSE
     Kz = z_s @ z_s.T
     Ke = e_s @ e_s.T
-
-    kernel_mse = ((Kz - Ke) ** 2).mean().item()
-    kernel_rmse = np.sqrt(kernel_mse)
-    ke_scale = np.sqrt((Ke ** 2).mean().item())
-    kernel_rmse_norm = kernel_rmse / (ke_scale + 1e-8)
-
-    z_normed = F.normalize(z_s, dim=1)
-    e_normed = F.normalize(e_s, dim=1)
-    cos_sim_mean = ((z_normed @ z_normed.T) * (e_normed @ e_normed.T)).mean().item()
-
-    z_norm_mean = z_s.norm(dim=1).mean().item()
-    z_norm_std  = z_s.norm(dim=1).std().item()
-
-    # --- Effective rank ---
-    # Compute singular values squared
+    rmse = torch.sqrt(torch.mean((Kz - Ke)**2)).item()
+    ke_scale = torch.sqrt(torch.mean(Ke**2)).item()
+    
+    # Effective Rank
     svals_sq = np.linalg.svd(z, compute_uv=False)**2
-    effective_rank = (svals_sq.sum()**2) / np.sum(svals_sq**2)
+    eff_rank = (svals_sq.sum()**2) / np.sum(svals_sq**2)
+    
+    return {"rmse_norm": rmse / (ke_scale + 1e-8), "effective_rank": eff_rank}
 
-    return {
-        "kernel_rmse": kernel_rmse,
-        "kernel_rmse_norm": kernel_rmse_norm,
-        "cos_sim_mean": cos_sim_mean,
-        "z_norm_mean": z_norm_mean,
-        "z_norm_std": z_norm_std,
-        "effective_rank": effective_rank
-    }
+def calculate_utility(row):
+    # Penalize the "White Noise" snap (RMSE near 1.0)
+    if row['rmse'] > 0.95:
+        return 0
+    
+    # Penalize the "Blob" snap (Rank near 1.0)
+    if row['rank'] < 2.0:
+        return 0
+
+    # Reward Rank, but only if RMSE is holding steady.
+    # This acts like an "Information Density" score.
+    # We want high rank, but we weigh it against (1 - RMSE)
+    return row['rank'] * (1.0 - row['rmse'])
 
 # ============================================================
-# Main evaluation loop
+# Main Execution
 # ============================================================
-
 if __name__ == "__main__":
-    # --- Load data ---
-    ebird = load_tifs("/home/breallis/datasets/ebird_weekly_2023_albers", 
-                      "whcspa_abundance_median_2023-*.tif")
-    valid_mask, ebird = mask_ebird(ebird)  # valid_mask: H x W
-
-    H, W, S_weeks = ebird.shape
-    ebird_flat = ebird.reshape(-1, S_weeks)          # (H*W x S_weeks)
-    valid_flat = valid_mask.flatten()                # (H*W,)
-    ebird_flat_valid = ebird_flat[valid_flat]       # only valid pixels
-
-    # Hellinger transform
-    ebird_flat_valid = hellinger_transform(ebird_flat_valid)
-
-    # Assume ebird_flat is Hellinger-transformed and masked
-    ell_recommended = estimate_rbf_lengthscale(ebird_flat_valid, quantile=0.05, n_samples=5000)
-    print("Recommended RBF lengthscale:", ell_recommended)
-
-    # --- Output folder ---
-    out_dir = "/home/breallis/dev/range_limits_pymc/misc_outputs/optimal_latent"
-    os.makedirs(out_dir, exist_ok=True)
-
-    # ============================================================
-    # Latent dimension & Hyperparameter Sweep (RQ Kernel)
-    # ============================================================
+    # --- 1. Load Data ---
+    DATA_DIR = "/home/breallis/datasets/ebird_weekly_2023_albers"
+    ebird_stack, meta = load_tifs_structured(DATA_DIR, "*_abundance_median_2023-*.tif")
     
-    # 1. Parameter Grid
-    # Added 16 to test if rank can go higher than 8 given sufficient flexibility
-    latent_dims = [4, 8, 16] 
+    H, W, D = ebird_stack.shape
     
-    # Hellinger space is small (max dist 2.0). 
-    # Smaller ells focus on local jaggedness; larger ells smooth it out.
-    ells = [0.1, 0.2, 0.4, 0.8]
+    # Create mask (Land vs Ocean)
+    # Assume any pixel with NaN in any band is invalid
+    valid_mask = np.any(~np.isnan(ebird_stack), axis=-1)
+    valid_flat = valid_mask.flatten()
     
-    # Alpha controls the tail weight. 
-    # 0.1 = Very heavy tails (continental signal); 1.6 = Moderate tails.
-    alphas = [0.1, 0.2, 0.4, 0.8, 1.6]
+    # Flatten and remove NaNs (Zero-fill for safe smoothing)
+    ebird_flat_raw = np.nan_to_num(ebird_stack).reshape(-1, D)[valid_flat]
     
-    # Store all results for final summary plotting
-    # Structure: summary_data[(dim, ell, alpha)] = diag_dict
-    summary_data = {}
+    OUT_DIR = "/home/breallis/dev/range_limits_pymc/misc_outputs/wide_sweep_v1"
+    os.makedirs(OUT_DIR, exist_ok=True)
+    
+    print(f"Processing {len(ebird_flat_raw)} valid pixels. Shape: {ebird_flat_raw.shape}")
 
-    print(f"\n{'Dim':<4} | {'Ell':<6} | {'Alpha':<6} | {'Eff Rank':<10} | {'RMSE Norm':<10} | {'Cos Sim':<10}")
-    print("-" * 60)
+    # --- 2. Broad Parameter Sweep ---
+    # Dims: Extended to 32 as requested
+    latent_dims = [16, 32] 
+    
+    # Sigmas: 
+    # 0.0 = Raw Data (Hypothesis: Time is exact)
+    # 0.5 = Jitter Fix (Hypothesis: +/- 1 week error)
+    # 1.5 = Phenology (Hypothesis: +/- 3 week variation)
+    # 4.0 = Seasonal (Hypothesis: Broad seasonal presence matters more than timing)
+    sigmas = [0.5, 1.5, 4.0, 0.0]
+    
+    # Ells: jagged
+    ells = [0.1, 0.2, 0.3, 0.4, 0.5]
+    
+    # Alphas: Full spectrum from 'heavy tail' (0.1) to 'near RBF' (5.0)
+    alphas = [0.1, 0.3, 0.5, 1.0, 2.0, 4.0, 8.0]
 
-    for dim in latent_dims:
+    total_runs = len(sigmas) * len(latent_dims) * len(ells) * len(alphas)
+    run_count = 0
+    results = []
+
+    print(f"\n{'Run':<4} | {'Dim':<4} | {'Sig':<4} | {'Ell':<5} | {'Alph':<4} | {'Eff Rank':<10} | {'RMSE':<10}")
+    print("-" * 65)
+
+    # Outer loop: Smoothing is the expensive transform
+    for sig in sigmas:
+        X_smooth = smoothed_hellinger_transform(ebird_flat_raw, meta['n_weeks'], sigma=sig)
+        
+        # Sort dims to ensure logic is deterministic
+        sorted_dims = sorted(latent_dims)
+        max_dim = sorted_dims[-1]
+        
         for ell in ells:
             for alpha in alphas:
-                
-                # --- A. Compute Latent Embedding (Valid Pixels) ---
                 try:
-                    Z_opt_valid = compute_optimal_latent_z_rq(
-                        ebird_flat_valid, 
-                        latent_dim=dim, 
-                        lengthscale=ell, 
-                        alpha=alpha, 
-                        n_landmarks=5000 # Keep modest for speed in sweep
+                    # A. Compute the nested solution once for the largest dimension
+                    Z_max = compute_optimal_latent_z_rq(
+                        X_smooth, max_dim, ell, alpha, n_landmarks=5000
                     )
-                except Exception as e:
-                    print(f"{dim:<4} | {ell:<6.1f} | {alpha:<6.1f} | FAILED: {e}")
-                    continue
-
-                # --- B. Compute Diagnostics ---
-                diag = compute_kernel_diagnostics(Z_opt_valid, ebird_flat_valid)
-                
-                # Print status line
-                print(f"{dim:<4} | {ell:<6.1f} | {alpha:<6.1f} | {diag['effective_rank']:<10.2f} | {diag['kernel_rmse_norm']:<10.4f} | {diag['cos_sim_mean']:<10.4f}")
-                
-                # Store for summary
-                key = (dim, ell, alpha)
-                summary_data[key] = diag
-
-                # --- C. Save Full Raster (Mapping back to HxW) ---
-                Z_opt_full = np.full((H*W, dim), np.nan, dtype=np.float32)
-                Z_opt_full[valid_flat] = Z_opt_valid
-                
-                # Construct unique filename
-                base_name = f"dim{dim}_ell{ell:.1f}_alpha{alpha:.1f}"
-                
-                # Save the latent array
-                np.save(os.path.join(out_dir, f"Z_{base_name}.npy"), Z_opt_full)
-                
-                # Save diagnostics
-                np.savez(os.path.join(out_dir, f"diag_{base_name}.npz"), **diag)
-
-                # --- D. Save Visualization Maps (First 3 components only) ---
-                # Limiting to 3 components prevents generating excessive images
-                plot_range = range(min(dim, 3)) 
-                
-                for k in plot_range:
-                    latent_map = Z_opt_full[:, k].reshape(H, W)
                     
-                    plt.figure(figsize=(8, 6))
-                    plt.imshow(latent_map, cmap="viridis")
-                    plt.colorbar(label=f"Latent Comp {k+1}")
-                    plt.title(f"Latent {k+1} (D={dim}, l={ell}, a={alpha})\nRank:{diag['effective_rank']:.2f}, RMSE:{diag['kernel_rmse_norm']:.2f}")
-                    plt.axis("off")
-                    plt.tight_layout()
-                    plt.savefig(os.path.join(out_dir, f"map_{base_name}_comp{k+1}.png"))
-                    plt.close()
+                    # B. Slice and diagnose for each dimension in the sorted list
+                    for dim in sorted_dims:
+                        run_count += 1
+                        
+                        # Slice the pre-computed Z_max
+                        # Because dimensions are orthogonal and ordered by eigenvalue,
+                        # Z_max[:, :8] is identical to computing Z with latent_dim=8.
+                        Z_slice = Z_max[:, :dim]
+                        
+                        # Calculate Diagnostics
+                        diag = compute_kernel_diagnostics(Z_slice, X_smooth)
+                        
+                        # Update progress
+                        print(f"{run_count}/{total_runs:<3} | {dim:<4} | {sig:<4.1f} | {ell:<4.2f} | {alpha:<4.1f} | {diag['effective_rank']:<10.2f} | {diag['rmse_norm']:<10.4f}")
+                        
+                        results.append({
+                            "dim": dim, "sigma": sig, "ell": ell, "alpha": alpha,
+                            "rank": diag['effective_rank'], "rmse": diag['rmse_norm']
+                        })
+                        
+                        # C. Save Maps
+                        # Only save maps for the max_dim to avoid redundant images
+                        # (Z1, Z2, Z3 are identical regardless of whether you calculated 8 or 32 dims)
+                        if dim == max_dim:
+                            Z_full = np.full((H*W, dim), np.nan, dtype=np.float32)
+                            Z_full[valid_flat] = Z_slice
+                            
+                            base_name = f"d{dim}_s{sig}_l{ell}_a{alpha}"
+                            
+                            for k in range(min(dim, 3)):
+                                latent_map = Z_full[:, k].reshape(H, W)
+                                plt.figure(figsize=(5, 4))
+                                plt.imshow(latent_map, cmap="viridis")
+                                plt.title(f"Z{k+1} (Sig={sig}, L={ell}, a={alpha})\nR:{diag['effective_rank']:.1f}")
+                                plt.axis("off")
+                                plt.tight_layout()
+                                plt.savefig(os.path.join(OUT_DIR, f"map_{base_name}_c{k+1}.png"), dpi=100)
+                                plt.close()
+                            
+                except Exception as e:
+                    # If the max_dim calculation fails, increment run_count for all dims in the group
+                    print(f"Error for nested config at s{sig} l{ell} a{alpha}: {e}")
+                    run_count += len(sorted_dims)
 
-    # ============================================================
-    # Summary Visualization
-    # ============================================================
+    # --- 3. Summary Visualization ---
+    df = pd.DataFrame(results)    
+    # Calculate the Utility Score
+    df['utility'] = df.apply(calculate_utility, axis=1)
+    df.to_csv(os.path.join(OUT_DIR, "sweep_summary.csv"), index=False)
+
+   
+    # Identify the Pareto Front (Non-dominated solutions)
+    # A point is on the front if no other point has (Higher Rank AND Lower RMSE)
+    pareto_front = []
+    for idx, row in df.iterrows():
+        is_dominated = ((df['rank'] >= row['rank']) & (df['rmse'] <= row['rmse']) & 
+                        ((df['rank'] > row['rank']) | (df['rmse'] < row['rmse'])))
+        if not is_dominated.any():
+            pareto_front.append(row)
+            
+    df_pareto = pd.DataFrame(pareto_front).sort_values("rank")
+    df_pareto.to_csv(os.path.join(OUT_DIR, "sweep_pareto.csv"), index=False)
+
+    print("\n" + "="*80)
+    print(f"{'THE PARETO FRONT (Best Trade-offs)':^80}")
+    print("="*80)
+    print(df_pareto[['dim', 'sigma', 'ell', 'alpha', 'rank', 'rmse', 'utility']].to_string(index=False))
     
-    # Save aggregate results dictionary
-    np.save(os.path.join(out_dir, "summary_data.npy"), summary_data)
-    
-    # Create a scatter plot of Effective Rank vs RMSE for all runs
-    # Color coded by Alpha, Size by Lengthscale
-    
-    ranks = []
-    rmses = []
-    alpha_vals = []
-    ell_vals = []
-    dims = []
-    
-    for (d, l, a), res in summary_data.items():
-        ranks.append(res['effective_rank'])
-        rmses.append(res['kernel_rmse_norm'])
-        alpha_vals.append(a)
-        ell_vals.append(l)
-        dims.append(d)
+    if not df.empty:
+        plt.figure(figsize=(12, 10))
+        # X=Rank, Y=RMSE, Color=Sigma, Size=Ell, Marker=Alpha
+        # Since we have 4 vars, we need to be creative. 
+        # Let's facet or use marker styles, but for now, color=Alpha, Size=Ell, Shape by Sigma?
+        # Simple approach: Plot '0.0' and '1.5' sigma as separate series.
         
-    plt.figure(figsize=(10, 8))
-    
-    # Scatter plot
-    # s argument scales circle size by lengthscale for visual grouping
-    sc = plt.scatter(ranks, rmses, c=alpha_vals, s=np.array(ell_vals)*150 + 30, 
-                     cmap='viridis', alpha=0.8, edgecolors='k')
-    
-    cbar = plt.colorbar(sc)
-    cbar.set_label('Alpha (Tail Weight: Dark=Heavy, Yellow=Light)')
-    
-    plt.xlabel('Effective Rank (Higher is better)')
-    plt.ylabel('Kernel RMSE Norm (Lower is better)')
-    plt.title('Hyperparameter Sweep: Rank vs RMSE\n(Point Size = Lengthscale)')
-    plt.grid(True, alpha=0.3)
-    
-    # Annotate points that are "interesting" (High Rank + Decent RMSE)
-    # This helps identify the sweet spot quickly
-    for i in range(len(ranks)):
-        if ranks[i] > 4.0 and rmses[i] < 0.85:
-            plt.text(ranks[i], rmses[i], f" d{dims[i]}_l{ell_vals[i]}_a{alpha_vals[i]}", fontsize=8)
+        subset_0 = df[df['sigma'] == 0.0]
+        subset_1 = df[df['sigma'] == 1.5]
+        
+        plt.scatter(
+            subset_0['rank'], subset_0['rmse'], 
+            c=subset_0['alpha'], cmap='viridis', 
+            s=subset_0['ell']*200 + 50, alpha=0.6, edgecolors='k', marker='o', label='Sigma=0.0'
+        )
+        
+        plt.scatter(
+            subset_1['rank'], subset_1['rmse'], 
+            c=subset_1['alpha'], cmap='viridis', 
+            s=subset_1['ell']*200 + 50, alpha=0.6, edgecolors='r', marker='s', label='Sigma=1.5'
+        )
 
-    plt.savefig(os.path.join(out_dir, "parameter_sweep_summary.png"))
-    plt.close()
-
-    print(f"\nSweep complete. Results and summary plots saved to {out_dir}")
+        plt.colorbar(label='Alpha (Tail Weight)')
+        plt.legend(loc='upper right')
+        plt.xlabel('Effective Rank (Higher is Better)')
+        plt.ylabel('RMSE Norm (Lower is Better)')
+        plt.title('Broad Parameter Sweep: Rank vs RMSE\n(Size=Lengthscale, Color=Alpha, Shape=Smoothing)')
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(OUT_DIR, "summary_plot.png"))
+        plt.close()
+        print("\nSummary plot saved.")
