@@ -1,0 +1,10 @@
+.venv/
+.vscode/
+checkpoints/
+data/
+figures/
+notebooks/
+prism_monthly_4km/
+sanity_check_outputs/
+sanity_maps/
+misc_outputs/
