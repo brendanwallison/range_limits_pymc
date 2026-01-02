@@ -250,18 +250,12 @@ if __name__ == "__main__":
     # Dims: Extended to 32 as requested
     latent_dims = [16, 32] 
     
-    # Sigmas: 
-    # 0.0 = Raw Data (Hypothesis: Time is exact)
-    # 0.5 = Jitter Fix (Hypothesis: +/- 1 week error)
-    # 1.5 = Phenology (Hypothesis: +/- 3 week variation)
-    # 4.0 = Seasonal (Hypothesis: Broad seasonal presence matters more than timing)
-    sigmas = [0.5, 1.5, 4.0, 0.0]
-    
-    # Ells: jagged
-    ells = [0.1, 0.2, 0.3, 0.4, 0.5]
-    
-    # Alphas: Full spectrum from 'heavy tail' (0.1) to 'near RBF' (5.0)
-    alphas = [0.1, 0.3, 0.5, 1.0, 2.0, 4.0, 8.0]
+    # Parameters focused on the 0.2-0.5 Ell "Transition Zone"
+    sigmas = [0.5, 1.0, 1.5]
+    ells = [0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6]
+    alphas = [4.0, 8.0, 16.0]
+    latent_dims = [32, 64]
+    n_landmarks = 10000
 
     total_runs = len(sigmas) * len(latent_dims) * len(ells) * len(alphas)
     run_count = 0
@@ -283,7 +277,7 @@ if __name__ == "__main__":
                 try:
                     # A. Compute the nested solution once for the largest dimension
                     Z_max = compute_optimal_latent_z_rq(
-                        X_smooth, max_dim, ell, alpha, n_landmarks=5000
+                        X_smooth, max_dim, ell, alpha, n_landmarks=n_landmarks
                     )
                     
                     # B. Slice and diagnose for each dimension in the sorted list
