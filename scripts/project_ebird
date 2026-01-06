@@ -30,6 +30,9 @@ OCEAN_MASK = "/home/breallis/datasets/land_mask/ocean_mask_4km.tif"
 PNG_POWER = 0.25
 OUT_DIR = "/home/breallis/datasets/ebird_weekly_2023_albers"
 
+EBIRD_DIR = "/home/breallis/datasets/ebird_house_finch"
+OUT_DIR = "/home/breallis/datasets/ebird_house_finch_albers"
+
 # CRS for eBird rasters (from your metadata)
 EBIRD_CRS = "EPSG:8857"
 
