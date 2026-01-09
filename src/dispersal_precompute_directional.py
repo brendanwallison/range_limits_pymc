@@ -5,6 +5,7 @@
 import jax.numpy as jnp
 from jax.numpy.fft import fft2, ifft2
 from jax.scipy.special import gamma
+import numpy as np 
 
 # ------------------------------------------------------------
 # Toroidal distance grid
@@ -34,11 +35,6 @@ def edge_correction_from_fft(fft_land, fft_kernel, land_mask, Ny, Nx, eps=1e-12)
 # ------------------------------------------------------------
 # Toroidal-aware angular weights
 # ------------------------------------------------------------
-import jax.numpy as jnp
-
-import jax.numpy as jnp
-
-import jax.numpy as jnp
 
 def angular_weights_toroidal(Lx: int, Ly: int):
     """
@@ -50,12 +46,21 @@ def angular_weights_toroidal(Lx: int, Ly: int):
     y_idx, x_idx = jnp.meshgrid(jnp.arange(Ly), jnp.arange(Lx), indexing="ij")
     
     # Centered coordinates for toroidal FFT conventions
+    # y_idx=1 -> dy=1 (South 1 unit in matrix coords)
     dx = jnp.where(x_idx <= Lx // 2, x_idx, x_idx - Lx)
     dy = jnp.where(y_idx <= Ly // 2, y_idx, y_idx - Ly)
     
-    angles = jnp.arctan2(dy, dx)  # [-pi, pi], 0 = east, pi/2 = north
+    angles = jnp.arctan2(dy, dx)  # [-pi, pi]
 
-    directions = {'N': jnp.pi/2, 'S': -jnp.pi/2, 'E': 0.0, 'W': jnp.pi}
+    # PYTHON MATRIX CONVENTION:
+    # y increases downwards. dy > 0 is SOUTH. dy < 0 is NORTH.
+    # Angles: East=0, South=pi/2, West=pi, North=-pi/2
+    directions = {
+        'to_NORTH': -jnp.pi/2, 
+        'to_SOUTH':  jnp.pi/2, 
+        'to_EAST':   0.0, 
+        'to_WEST':   jnp.pi
+    }
     width = jnp.pi  # ±90° taper
 
     w_dict = {}
@@ -115,15 +120,38 @@ def prepare_dispersal_constants(
 
     # Angular directional weights
     angular_w = angular_weights_toroidal(Lx, Ly)
+    
+    # Store in lists to stack later (ensuring deterministic order)
+    # Recommended order for 'juvenile_fft_kernel_stack': to_NORTH, to_SOUTH, to_EAST, to_WEST
+    stack_keys = ['to_NORTH', 'to_SOUTH', 'to_EAST', 'to_WEST']
+    
+    juvenile_fft_list = []
+    juvenile_edge_list = []
+    
+    # We still return the dicts if the legacy code needs them, 
+    # but the primary output for the new model is the STACK.
     juvenile_fft_kernels = {}
     juvenile_edge_corrections = {}
-    for d, w in angular_w.items():
+    
+    for d in stack_keys:
+        w = angular_w[d]
         k_dir = juvenile_kernel * w
         k_dir = k_dir / jnp.sum(k_dir)
-        juvenile_fft_kernels[d] = fft2(k_dir)
-        juvenile_edge_corrections[d] = edge_correction_from_fft(
-            fft_land, juvenile_fft_kernels[d], land_mask, Ny, Nx
-        )
+        
+        fft_k = fft2(k_dir)
+        edge_c = edge_correction_from_fft(fft_land, fft_k, land_mask, Ny, Nx)
+        
+        # Populate lists for stack
+        juvenile_fft_list.append(fft_k)
+        juvenile_edge_list.append(edge_c)
+        
+        # Populate legacy dicts
+        juvenile_fft_kernels[d] = fft_k
+        juvenile_edge_corrections[d] = edge_c
+
+    # Create stacks for vectorized processing
+    juvenile_fft_stack = jnp.stack(juvenile_fft_list, axis=0)
+    juvenile_edge_stack = jnp.stack(juvenile_edge_list, axis=0)
 
     return {
         "fft_land": fft_land,
@@ -133,6 +161,8 @@ def prepare_dispersal_constants(
         "Lx": Lx,
         "adult_fft_kernel": adult_fft_kernel,
         "adult_edge_correction": adult_edge_correction,
-        "juvenile_fft_kernels": juvenile_fft_kernels,
-        "juvenile_edge_corrections": juvenile_edge_corrections,
+        "juvenile_fft_kernels": juvenile_fft_kernels, # Legacy dict
+        "juvenile_edge_corrections": juvenile_edge_corrections, # Legacy dict
+        "juvenile_fft_kernel_stack": juvenile_fft_stack, # New Model Input (4, Ly, Lx)
+        "juvenile_edge_correction_stack": juvenile_edge_stack, # New Model Input (4, Ny, Nx)
     }
