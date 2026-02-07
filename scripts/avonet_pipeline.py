@@ -232,7 +232,5 @@ def main():
 
     print(f"Saved rank-based comparison table to {OUTPUT_COMPARISON}")
 
-
-
 if __name__ == "__main__":
     main()
