@@ -222,6 +222,62 @@ def plot_global_abundance(data, sim, output_dir):
     plt.savefig(os.path.join(output_dir, "diagnostics_abundance_fit.png"), dpi=200)
     plt.close()
 
+def plot_modern_biological_baseline(data, r_modern, s_modern, K_modern, Q_modern, output_dir):
+    """
+    Plots the average 1960-2023 maps for the four fundamental biological grids.
+    """
+    print("Generating Modern Biological Baseline Maps (1960-2023)...")
+    Ny, Nx = data['Ny'], data['Nx']
+    land_mask = data['land_mask']
+    
+    # 1. Calculate Means across the modern window
+    # Note: If these were passed already averaged, np.mean will just return them as is.
+    r_avg = np.mean(r_modern, axis=0) if r_modern.ndim == 3 else r_modern
+    s_avg = np.mean(s_modern, axis=0) if s_modern.ndim == 3 else s_modern
+    K_avg = np.mean(K_modern, axis=0) if K_modern.ndim == 3 else K_modern
+    
+    # For Q, we visualize the 'Best Case' path survival out of each pixel
+    # Q_modern is (Time, Ny, Nx, Kernels) or (Ny, Nx, Kernels)
+    if Q_modern.ndim == 4:
+        Q_spatial = np.mean(Q_modern, axis=0)
+    else:
+        Q_spatial = Q_modern
+    Q_best = np.max(Q_spatial, axis=-1)
+
+    # 2. Setup Plotting Grid
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    plots = [
+        (r_avg, "Growth Rate (r)", "RdYlGn", axes[0, 0], None),
+        (K_avg, "Carrying Capacity (K)", "viridis", axes[0, 1], 'log'),
+        (s_avg, "Local Establishment (s)", "plasma", axes[1, 0], (0, 1)),
+        (Q_best, "Max Path Survival (Best Q)", "magma", axes[1, 1], (0, 1))
+    ]
+
+    for grid, title, cmap, ax, scale in plots:
+        masked_grid = np.ma.masked_where(land_mask == 0, grid)
+        
+        # Handle scaling/limits
+        if scale == 'log':
+            im = ax.imshow(np.log1p(masked_grid), cmap=cmap, origin='upper')
+            cbar_label = "Log(1+K)"
+        elif isinstance(scale, tuple):
+            im = ax.imshow(masked_grid, cmap=cmap, origin='upper', vmin=scale[0], vmax=scale[1])
+            cbar_label = "Probability"
+        else:
+            # For r, center the colormap around 0 if there are negative values
+            vabs = np.nanmax(np.abs(grid))
+            im = ax.imshow(masked_grid, cmap=cmap, origin='upper', vmin=-vabs, vmax=vabs)
+            cbar_label = "Value"
+
+        ax.set_title(title, fontsize=14)
+        ax.axis('off')
+        plt.colorbar(im, ax=ax, label=cbar_label, fraction=0.046, pad=0.04)
+
+    plt.suptitle("Modern Biological Parameter Baselines (1960-2023)", fontsize=18, y=0.95)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(os.path.join(output_dir, "diagnostics_modern_baselines.png"), dpi=200)
+    plt.close()
+
 def plot_parameter_distributions(r_flat, s_flat, Q_flat, output_dir):
     print("Generating Parameter Histograms...")
     
@@ -265,7 +321,7 @@ import numpy as np
 
 def analyze_dispersal_kernel(data, scalars, output_dir):
     print("Analyzing Impulse Response Kernels...")
-    p_juv = jnn.sigmoid(scalars['dispersal_intercept'])
+    p_disp = jnn.sigmoid(scalars['dispersal_intercept'])
     
     # Get kernel dimensions directly from the data
     adult_k = data['adult_fft_kernel']
@@ -313,7 +369,7 @@ def analyze_dispersal_kernel(data, scalars, output_dir):
     # 3. Plotting
     plt.figure(figsize=(10, 6))
     plt.plot(bins[:-1], p_a_norm, 'b-', label='Adults (Short-Range)')
-    plt.plot(bins[:-1], p_j_norm, 'r--', label=f'Juveniles (Long-Range, {p_juv*100:.1f}%)')
+    plt.plot(bins[:-1], p_j_norm, 'r--', label=f'Juveniles (Long-Range, {p_disp*100:.1f}%)')
     
     plt.xlabel("Distance (Pixels)")
     plt.ylabel("Relative Probability Density")
@@ -506,76 +562,85 @@ def _render_comparison_plot(data, grid_a, grid_b, title, filename, output_dir, l
     plt.savefig(os.path.join(output_dir, filename), dpi=200)
     plt.close()
 
-def plot_theoretical_niche_suite(data, r_grid, s_grid, Q_grid, scalars, labels, output_dir):
-    print("Generating Comprehensive Niche & Comparison Suite...")
+def plot_theoretical_niche_suite(data, r_modern, s_modern, Q_modern, scalars, labels, output_dir):
+    print("Generating Modern Comprehensive Niche Suite (1960-2023)...")
     
-    # --- 1. Extraction & Scalar Context ---
-    # p_juv: Fraction of population moving.
+    # 1. Extraction & Scalar Context
     p_juv = jnn.sigmoid(scalars['dispersal_intercept'])
-    r_mean = np.mean(r_grid, axis=0) if r_grid.ndim == 3 else r_grid
-    s_mean = np.mean(s_grid, axis=0) if s_grid.ndim == 3 else s_grid
-    Q_spatial = np.mean(Q_grid, axis=0) if Q_grid.ndim == 4 else Q_grid
     
-    # --- 2. The Baseline: Adult Static Niche ---
-    # Established population persistence (Stayers + Local Settlement)
-    phi_adult = (1 - p_juv) + (p_juv * s_mean)
-    R_adult = r_mean + np.log(np.maximum(phi_adult, 1e-6))
-    _render_niche_plot(data, R_adult, "Adult Static Niche (Established Persistence)", 
-                       "niche_adult_static.png", output_dir, mode='binary')
+    # --- CRITICAL FIX: REDUCE TIME DIMENSION ---
+    # We take the mean across the 65 years to get a single 2D baseline map
+    r_mean = np.mean(r_modern, axis=0) if r_modern.ndim == 3 else r_modern
+    s_mean = np.mean(s_modern, axis=0) if s_modern.ndim == 3 else s_modern
+    
+    # Q_modern is (Time, Ny, Nx, Kernels)
+    Q_spatial = np.mean(Q_modern, axis=0) if Q_modern.ndim == 4 else Q_modern
+    
+    # --- 2. The Intrinsic (Fenced) Static Niche ---
+    # phi = (Adult Stayers) + (Juvenile Stayers * Survival)
+    phi_intrinsic = (1 - p_juv) + (p_juv * s_mean)
+    R_static = r_mean + np.log(np.maximum(phi_intrinsic, 1e-6))
+    
+    # Now R_static is (181, 288), which matches land_mask!
+    _render_niche_plot(data, R_static, f"Modern Intrinsic Static Niche (p_juv={p_juv:.2f})", 
+                       "niche_intrinsic_static.png", output_dir, mode='binary')
 
-    # --- 3. The Pure Juvenile Kinetic Niches ---
-    # Colonization Potential: R = r + log(Q_k)
-    # No "stayer" buffer. Does a pioneer survive arriving via kernel K?
+    # --- 3. The Juvenile Kinetic Niches ---
     juv_dir = os.path.join(output_dir, "juvenile_kinetic")
     os.makedirs(juv_dir, exist_ok=True)
     
-    # Store results for comparisons
     k_results = {}
     for k, lab in enumerate(labels):
+        # Q_spatial[..., k] is now (181, 288)
         R_k = r_mean + np.log(np.maximum(Q_spatial[..., k], 1e-6))
         k_results[lab] = R_k
         _render_niche_plot(data, R_k, f"Juvenile Kinetic Niche: {lab}", 
                            f"juv_niche_{lab}.png", juv_dir, mode='binary')
 
-    # --- 4. Cardinal & Combined Niches ---
+    # --- 3. The Juvenile Kinetic Niches (Colonization) ---
+    # Logic: A pioneer juvenile arrives at an empty pixel via kernel K.
+    # They face path survival Q_k. 
+    # Because they are the FIRST arrivals, they are effectively 100% juvenile.
+    # Growth Potential: R = r + log(Q_k)
+    juv_dir = os.path.join(output_dir, "juvenile_kinetic")
+    os.makedirs(juv_dir, exist_ok=True)
+    
+    k_results = {}
+    for k, lab in enumerate(labels):
+        # Note: Colonizers don't get the (1-p_juv) adult buffer! 
+        # They are juveniles in transit.
+        R_k = r_mean + jnp.log(jnp.maximum(Q_spatial[..., k], 1e-6))
+        k_results[lab] = R_k
+        _render_niche_plot(data, R_k, f"Juvenile Kinetic Niche: {lab}", 
+                           f"juv_niche_{lab}.png", juv_dir, mode='binary')
+
+    # --- 4. Cardinal Comparisons (Logic remains sound, using corrected R_k) ---
     comp_dir = os.path.join(output_dir, "comparisons")
     os.makedirs(comp_dir, exist_ok=True)
     
     bins = sorted(list(set([l.split('_', 2)[-1] for l in labels])))
     for dist_bin in bins:
-        # Define Groupings
-        east = f"to_EAST_{dist_bin}"
-        west = f"to_WEST_{dist_bin}"
-        north = f"to_NORTH_{dist_bin}"
-        south = f"to_SOUTH_{dist_bin}"
+        east, west = f"to_EAST_{dist_bin}", f"to_WEST_{dist_bin}"
+        north, south = f"to_NORTH_{dist_bin}", f"to_SOUTH_{dist_bin}"
 
-        # A. Binary Comparisons: Directional Advantage
         if east in k_results and west in k_results:
             _render_comparison_plot(data, k_results[east], k_results[west],
                                     f"Directional Advantage: East vs West ({dist_bin})",
                                     f"comp_E_vs_W_{dist_bin}.png", comp_dir, 
                                     labels_ab=("East", "West"))
-        
-        if north in k_results and south in k_results:
-            _render_comparison_plot(data, k_results[north], k_results[south],
-                                    f"Directional Advantage: North vs South ({dist_bin})",
-                                    f"comp_N_vs_S_{dist_bin}.png", comp_dir, 
-                                    labels_ab=("North", "South"))
-
-        # B. Cost Comparison (Non-Binary Delta)
-        # Where is East cheaper/safer than West?
-        if east in k_results and west in k_results:
+            
+            # Save the fitness delta (Continuous)
             delta = k_results[east] - k_results[west]
             plt.figure(figsize=(10, 8))
             v = np.nanpercentile(np.abs(delta), 98)
             plt.imshow(np.ma.masked_where(data['land_mask']==0, delta), 
                        cmap='PiYG', vmin=-v, vmax=v, origin='upper')
             plt.colorbar(label="Fitness Advantage (East - West)")
-            plt.title(f"Relative Migration Cost: East vs West ({dist_bin})")
+            plt.title(f"Migration Fitness Delta: East vs West ({dist_bin})")
             plt.savefig(os.path.join(comp_dir, f"cost_delta_E_W_{dist_bin}.png"))
             plt.close()
 
-    print(f"--- All Diagnostic Maps Generated in {output_dir} ---")
+    print(f"--- Theoretical Niche Suite Complete ---")
 
 def plot_overall_static_niche(data, r_grid, s_grid, scalars, output_dir):
     """
@@ -585,13 +650,13 @@ def plot_overall_static_niche(data, r_grid, s_grid, scalars, output_dir):
     print("Generating Stationary Niche (Full population, zero dispersal)...")
     
     # Extraction
-    p_juv = jnn.sigmoid(scalars['dispersal_intercept'])
+    p_disp = jnn.sigmoid(scalars['dispersal_intercept'])
     r_mean = np.mean(r_grid, axis=0) if r_grid.ndim == 3 else r_grid
     s_mean = np.mean(s_grid, axis=0) if s_grid.ndim == 3 else s_grid
     
     # phi is the probability that a member of the population survives 
     # the year GIVEN they do not use a long-distance kernel.
-    phi_stationary = (1 - p_juv) + (p_juv * s_mean)
+    phi_stationary = (1 - p_disp) + (p_disp * s_mean)
     R_static = r_mean + np.log(np.maximum(phi_stationary, 1e-6))
     
     _render_niche_plot(data, R_static, "Stationary Niche (Established Persistence)", 
@@ -698,18 +763,35 @@ def plot_results():
     r_grid = scatter_to_grid_robust(np.array(sim['r_flat']), rows, cols, (Ny, Nx))
     s_grid = scatter_to_grid_robust(np.array(sim['s_flat']), rows, cols, (Ny, Nx))
     Q_grid = scatter_to_grid_robust(np.array(sim['Q_flat']), rows, cols, (Ny, Nx))
+    K_grid = scatter_to_grid_robust(np.array(sim['K_flat']), rows, cols, (Ny, Nx))
+
     obs_grid = scatter_observations_to_grid(data['observed_results'], data['obs_time_indices'], data['obs_rows'], data['obs_cols'], (Ny, Nx), data['time'])
     
     scalars = {k: sim[k] for k in ['dispersal_intercept', 'dispersal_logit_intercept', 'dispersal_logit_slope', 'allee_intercept']}
 
-    # Execute Full Diagnostic Suite
+    start_year = 1960
+    # Find the index where years >= 1960
+    start_idx = np.where(years >= start_year)[0][0]
+    
+    # 2. Slice the grids to the modern window
+    # r_grid: (Time, Ny, Nx) -> Slice axis 0
+    # s_grid: (Time, Ny, Nx) -> Slice axis 0
+    # Q_grid: (Time, Ny, Nx, K) -> Slice axis 0
+    r_modern = r_grid[start_idx:]
+    s_modern = s_grid[start_idx:]
+    Q_modern = Q_grid[start_idx:]
+    K_modern = K_grid[start_idx:]
+
+
+    # Execute Full Diagnostic Suite 
+    plot_modern_biological_baseline(data, r_modern, s_modern, K_modern, Q_modern, OUTPUT_PLOT_DIR)
     create_animation(density, obs_grid, years, OUTPUT_PLOT_DIR, data['land_mask'])
     create_animation(density_cf, obs_grid, years, OUTPUT_PLOT_DIR, data['land_mask'], "evolution_counterfactual.mp4")
     plot_global_k_trend(sim, data['years'], OUTPUT_PLOT_DIR)
     plot_parameter_shifts(data, sim, data['years'], OUTPUT_PLOT_DIR)
-    plot_overall_static_niche(data, r_grid, s_grid, scalars, OUTPUT_PLOT_DIR)
+    #plot_overall_static_niche(data, r_grid, s_grid, scalars, OUTPUT_PLOT_DIR)
     plot_temporal_anomalies(params, data, OUTPUT_PLOT_DIR)
-    plot_theoretical_niche_suite(data, r_grid, s_grid, Q_grid, scalars, labels, OUTPUT_PLOT_DIR)
+    plot_theoretical_niche_suite(data, r_modern, s_modern, Q_modern, scalars, labels, OUTPUT_PLOT_DIR)
     plot_global_abundance(data, sim, OUTPUT_PLOT_DIR)
     #plot_automated_cardinal_pairs(data, r_grid, s_grid, Q_grid, scalars, labels, OUTPUT_PLOT_DIR)
 
