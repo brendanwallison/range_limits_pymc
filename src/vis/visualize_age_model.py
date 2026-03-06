@@ -28,7 +28,7 @@ PRECISION = 'float32'
 jax.config.update("jax_enable_x64", True if PRECISION == 'float64' else False)
 
 INPUT_DIR = "/home/breallis/processed_data/model_inputs/numpyro_input"
-RESULT_DIR = f"/home/breallis/processed_data/model_results/age_map_{PRECISION}_run_01"
+RESULT_DIR = f"/home/breallis/processed_data/model_results/age_map_{PRECISION}_run_09"
 OUTPUT_PLOT_DIR = os.path.join(RESULT_DIR, "plots_analysis")
 os.makedirs(OUTPUT_PLOT_DIR, exist_ok=True)
 
@@ -122,8 +122,6 @@ def plot_directional_asymmetry(data, Sa_grid, Sj_grid, Fmax_grid, Q_grid, labels
             v = np.nanpercentile(np.abs(delta_we), 98)
             masked_delta_we = np.ma.masked_where(data['land_mask']==0, delta_we)
             
-            # Green (Positive) = Better to arrive from West
-            # Pink (Negative) = Better to arrive from East
             plt.imshow(masked_delta_we, cmap='PiYG', vmin=-v, vmax=v, origin='upper')
             plt.colorbar(label="Advantage: Arriving from West > Arriving from East")
             plt.title(f"Migration Fitness Delta: Origin West vs Origin East ({dist_bin}km)")
@@ -141,12 +139,9 @@ def plot_directional_asymmetry(data, Sa_grid, Sj_grid, Fmax_grid, Q_grid, labels
             idx_to_north = labels.index(kernel_to_north)
             idx_to_south = labels.index(kernel_to_south)
             
-            # Traveling NORTH means originating from the SOUTH
             fit_from_south = R0 * Q_spatial[..., idx_to_north]
-            # Traveling SOUTH means originating from the NORTH
             fit_from_north = R0 * Q_spatial[..., idx_to_south]
             
-            # Binary Categorical Comparison
             _render_comparison_plot(
                 data, fit_from_south, fit_from_north,
                 f"Pioneer Success: Arriving from South vs North ({dist_bin}km)",
@@ -154,15 +149,12 @@ def plot_directional_asymmetry(data, Sa_grid, Sj_grid, Fmax_grid, Q_grid, labels
                 labels_ab=("From South", "From North")
             )
             
-            # Continuous Fitness Delta Map
             delta_sn = fit_from_south - fit_from_north
             
             plt.figure(figsize=(10, 8))
             v = np.nanpercentile(np.abs(delta_sn), 98)
             masked_delta_sn = np.ma.masked_where(data['land_mask']==0, delta_sn)
             
-            # Purple (Positive) = Better to arrive from South
-            # Orange (Negative) = Better to arrive from North
             plt.imshow(masked_delta_sn, cmap='PuOr', vmin=-v, vmax=v, origin='upper')
             plt.colorbar(label="Advantage: Arriving from South > Arriving from North")
             plt.title(f"Migration Fitness Delta: Origin South vs Origin North ({dist_bin}km)")
@@ -175,25 +167,45 @@ def scatter_observations_to_grid(obs, t_idx, rows, cols, shape, time_steps):
     grid[t_idx, rows, cols] = obs
     return grid
 
-def create_animation(density, obs_grid, years, output_dir, land_mask, filename="evolution_history.mp4"):
+def create_animation(density, obs_grid, years, output_dir, land_mask, filename="evolution_history.mp4", logscale=False):
     print(f"Generating Animation: {filename}...")
+    
     fig, (ax_sim, ax_obs) = plt.subplots(1, 2, figsize=(14, 7))
     plt.subplots_adjust(top=0.85)
-    vmax = np.log1p(np.nanpercentile(density, 99))
-    im_sim = ax_sim.imshow(np.log1p(density[0]), cmap='magma', origin='upper', vmin=0, vmax=vmax)
-    land_bg = np.zeros_like(land_mask, dtype=float); land_bg[land_mask == 1] = 0.2
+    
+    # 1. Define the dynamic normalization object
+    vmax_val = np.nanpercentile(density, 99)
+    if logscale:
+        # vmin=1e-6 forces the colormap to stretch all the way down to microscopic densities
+        norm = mcolors.LogNorm(vmin=1e-6, vmax=vmax_val)
+    else:
+        norm = mcolors.Normalize(vmin=0, vmax=vmax_val)
+    
+    # 2. Pass the 'norm' object directly to imshow instead of transforming the data
+    im_sim = ax_sim.imshow(density[0], cmap='magma', origin='upper', norm=norm)
+    
+    land_bg = np.zeros_like(land_mask, dtype=float)
+    land_bg[land_mask == 1] = 0.2
     ax_obs.imshow(land_bg, cmap='gray_r', vmin=0, vmax=1, origin='upper', alpha=0.3)
-    im_obs = ax_obs.imshow(np.log1p(obs_grid[0]), cmap='magma', origin='upper', vmin=0, vmax=vmax, interpolation='none')
+    
+    im_obs = ax_obs.imshow(obs_grid[0], cmap='magma', origin='upper', norm=norm, interpolation='none')
+    
     title = fig.suptitle(f"Year: {years[0]}", fontsize=16, fontweight='bold')
 
     def update(frame):
         title.set_text(f"Year: {years[frame]}")
-        im_sim.set_data(np.log1p(density[frame]))
-        im_obs.set_data(np.log1p(obs_grid[frame]))
+        
+        # 3. If logscale, clip the bottom at 1e-8 to prevent log(0) crashes during rendering
+        sim_data = np.clip(density[frame], 1e-8, None) if logscale else density[frame]
+        obs_data = np.clip(obs_grid[frame], 1e-8, None) if logscale else obs_grid[frame]
+        
+        im_sim.set_data(sim_data)
+        im_obs.set_data(obs_data)
         return im_sim, im_obs, title
 
     ani = animation.FuncAnimation(fig, update, frames=len(years), interval=100, blit=False)
     save_path = os.path.join(output_dir, filename)
+    
     try:
         writer = animation.FFMpegWriter(fps=10, bitrate=1800)
         ani.save(save_path, writer=writer)
@@ -202,14 +214,16 @@ def create_animation(density, obs_grid, years, output_dir, land_mask, filename="
         ani.save(save_path.replace(".mp4", ".gif"), writer='pillow', fps=10)
     plt.close()
 
+
 def reconstruct_simulation(data, params):
     print("Reconstructing latent fields...")
     model = build_model_2d
     guide = AutoDelta(model)
     
+    # UPDATED: Replaced beta_s/beta_r with the actual sampled sites w_env and L_corr
     return_sites = [
         "simulated_density", "Sa_flat", "Sj_flat", "Fmax_flat", "K_flat", "Q_flat", "expected_obs",
-        "st_weights", "beta_h", "dispersal_random",
+        "st_weights", "w_env", "L_corr", "dispersal_random",
         "dispersal_logit_intercept", "dispersal_logit_slope",
         "allee_intercept", "allee_slope_raw",
         "alpha_a", "alpha_j", "alpha_f", "alpha_k"
@@ -238,10 +252,6 @@ def scatter_to_grid_robust(flat_array, rows, cols, shape):
     return None
 
 def rebuild_age_pools(sim, data, params):
-    """
-    Reruns the forward simulation using the MAP parameters to explicitly 
-    extract the N_adult and N_juvenile spatial grids over time.
-    """
     print("Rebuilding explicit Age-Structured Pools (Na, Nj)...")
     time = data['time']
     Ny, Nx = data['Ny'], data['Nx']
@@ -301,14 +311,146 @@ def rebuild_age_pools(sim, data, params):
 
 # --- VISUALIZATIONS ---
 
+def plot_demographic_timeseries(data, years, Sa_grid, Sj_grid, Fmax_grid, K_grid, output_dir):
+    print("Generating Demographic Trajectories Over Time...")
+    land_mask = data['land_mask']
+    scalar = data.get('pop_scalar', 1.0)
+    
+    # Isolate valid land pixels to avoid averaging in ocean/nan values
+    valid_pixels = land_mask == 1
+    
+    # Calculate the mean across all land pixels for each year
+    Sa_trend = np.mean(Sa_grid[:, valid_pixels], axis=1)
+    Sj_trend = np.mean(Sj_grid[:, valid_pixels], axis=1)
+    Fmax_trend = np.mean(Fmax_grid[:, valid_pixels], axis=1)
+    K_trend = np.mean(K_grid[:, valid_pixels], axis=1) * scalar
+    
+    # Global replacement rate over time
+    R0_trend = (Fmax_trend * Sj_trend) / (1.0 - Sa_trend + 1e-6)
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+    
+    # Panel 1: Survival
+    axes[0].plot(years, Sa_trend, label='Adult Survival ($S_a$)', color='darkblue', lw=2)
+    axes[0].plot(years, Sj_trend, label='Juvenile Survival ($S_j$)', color='dodgerblue', lw=2)
+    axes[0].set_ylabel("Mean Probability")
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+    
+    # Panel 2: Reproduction & Fitness
+    axes[1].plot(years, Fmax_trend, label='Max Fecundity ($F_{max}$)', color='forestgreen', lw=2)
+    axes[1].plot(years, R0_trend, label='Expected Replacement ($R_0$)', color='darkorange', lw=2)
+    axes[1].axhline(1.0, color='red', linestyle='--', alpha=0.5, label='Stable Threshold')
+    axes[1].set_ylabel("Mean Rate")
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+    
+    # Panel 3: Carrying Capacity
+    axes[2].plot(years, K_trend, color='purple', lw=2)
+    axes[2].set_ylabel("Mean Carrying Capacity ($K$)")
+    axes[2].set_xlabel("Year")
+    axes[2].grid(True, alpha=0.3)
+    
+    plt.suptitle("Continental Demographic Trends (1960-2023)", fontsize=16, y=0.98)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "trend_demographics_timeseries.png"), dpi=200)
+    plt.close()
+
+def plot_habitat_shift_map(data, Sa_grid, Sj_grid, Fmax_grid, output_dir):
+    print("Mapping Historical Habitat Shifts (First vs. Last Decade)...")
+    land_mask = data['land_mask']
+    
+    # Calculate R0 for all spatial pixels across all time steps
+    R0_grid = (Fmax_grid * Sj_grid) / (1.0 - Sa_grid + 1e-6)
+    
+    # Compare early period (first 10 years) to late period (last 10 years)
+    # Using 10-year means prevents a single weird weather year from ruining the map
+    early_R0 = np.mean(R0_grid[:10], axis=0)
+    late_R0 = np.mean(R0_grid[-10:], axis=0)
+    
+    delta_R0 = late_R0 - early_R0
+    masked_delta = np.ma.masked_where(land_mask == 0, delta_R0)
+    
+    # Get symmetric bounds so white is exactly zero change
+    v = np.nanpercentile(np.abs(masked_delta), 98) 
+    
+    plt.figure(figsize=(10, 8))
+    # PuOr: Purple = Improving (Sourcing), Orange = Degrading (Sinkifying)
+    cmap = plt.cm.get_cmap('PuOr', 11) 
+    im = plt.imshow(masked_delta, cmap=cmap, vmin=-v, vmax=v, origin='upper')
+    
+    plt.colorbar(im, label="Change in Replacement Rate ($\Delta R_0$)")
+    plt.title("Ecological Shift: Habitat Degradation vs Improvement\n(Last Decade vs First Decade)")
+    plt.axis('off')
+    plt.savefig(os.path.join(output_dir, "map_habitat_shift_R0.png"), dpi=200)
+    plt.close()
+
+def explore_manifold_correlation(sim, Sj_grid, Fmax_grid, output_dir, land_mask):
+    print("Exploring 2D Manifold Correlations...")
+    
+    # 1. Extract the learned LKJ Correlation Matrix from the predictive simulation
+    L_corr = sim['L_corr']
+    corr_matrix = L_corr @ L_corr.T
+    learned_rho = corr_matrix[0, 1]
+        
+    # 2. Extract empirical correlation from the sampled weights matrix
+    w_env = sim['w_env']
+    beta_s = w_env[:, 0]
+    beta_r = w_env[:, 1]
+    weight_corr = np.corrcoef(beta_s, beta_r)[0, 1]
+    
+    # 3. Flatten the spatial grids for the scatter plot
+    Sj_avg = np.mean(Sj_grid, axis=0)
+    Fmax_avg = np.mean(Fmax_grid, axis=0)
+    
+    valid_pixels = land_mask == 1
+    Sj_vals = Sj_avg[valid_pixels]
+    Fmax_vals = Fmax_avg[valid_pixels]
+    
+    # --- Plotting ---
+    fig = plt.figure(figsize=(12, 6))
+    
+    ax_text = fig.add_subplot(121)
+    ax_text.axis('off')
+    info_text = (
+        f"Manifold Diagnostics\n\n"
+        f"Learned LKJ Correlation (ρ): {learned_rho:.3f}\n"
+        f"Empirical Weight Corr:     {weight_corr:.3f}\n\n"
+    )
+    
+    if learned_rho < 0:
+        info_text += "Conclusion: The model explicitly learned a\nNEGATIVE correlation. It believes environments\nthat are good for survival are structurally bad\nfor reproduction."
+    elif learned_rho < 0.3:
+        info_text += "Conclusion: The model learned near-zero\ncorrelation. Survival and Reproduction operate\non totally independent environmental axes."
+    else:
+        info_text += "Conclusion: The model learned a positive\ncorrelation, but spatial deviations are likely\ndriving local trade-offs."
+        
+    ax_text.text(0.05, 0.5, info_text, fontsize=14, va='center', ha='left', family='monospace')
+    
+    ax_scatter = fig.add_subplot(122)
+    hb = ax_scatter.hexbin(Sj_vals, Fmax_vals, gridsize=40, cmap='inferno', mincnt=1)
+    ax_scatter.set_xlabel("Average Juvenile Survival ($S_j$)")
+    ax_scatter.set_ylabel("Average Max Fecundity ($F_{max}$)")
+    ax_scatter.set_title("Spatial Trade-off: Productivity vs. Survival")
+    plt.colorbar(hb, ax=ax_scatter, label="Number of Pixels")
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "diagnostics_manifold_correlation.png"), dpi=200)
+    plt.close()
+
 def plot_demographic_baselines(data, Sa_grid, Sj_grid, Fmax_grid, K_grid, output_dir):
     print("Generating Age-Structured Demographic Baselines...")
     land_mask = data['land_mask']
     
+    # Extract the scalar to convert latent K to expected real-world carrying capacity
+    scalar = data.get('pop_scalar', 1.0)
+    
     Sa_avg = np.mean(Sa_grid, axis=0)
     Sj_avg = np.mean(Sj_grid, axis=0)
     Fmax_avg = np.mean(Fmax_grid, axis=0)
-    K_avg = np.mean(K_grid, axis=0)
+    
+    # Scale K to represent actual expected bird counts
+    K_avg = np.mean(K_grid, axis=0) * scalar
     
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     plots = [
@@ -322,7 +464,7 @@ def plot_demographic_baselines(data, Sa_grid, Sj_grid, Fmax_grid, K_grid, output
         masked_grid = np.ma.masked_where(land_mask == 0, grid)
         if scale == 'log':
             im = ax.imshow(np.log1p(masked_grid), cmap=cmap, origin='upper')
-            cbar_label = "Log(1+K)"
+            cbar_label = "Log(1 + Real Expected Birds)"
         elif isinstance(scale, tuple):
             im = ax.imshow(masked_grid, cmap=cmap, origin='upper', vmin=scale[0], vmax=scale[1])
             cbar_label = "Probability"
@@ -368,7 +510,7 @@ def plot_age_structure_dynamics(Na_grid, Nj_grid, years, output_dir, land_mask):
         na = Na_grid[t_idx]
         nj = Nj_grid[t_idx]
         
-        # Only plot age structure where birds actually exist (Density > 0.01)
+        # Kept at 0.01 as requested
         valid_pop = (na + nj) > 0.01
         rho_spatial = np.where(valid_pop, nj / (na + nj + 1e-9), np.nan)
         rho_masked = np.ma.masked_where((land_mask == 0) | ~valid_pop, rho_spatial)
@@ -399,13 +541,10 @@ def analyze_source_sink_mortality(data, Sa_grid, Sj_grid, Fmax_grid, Q_grid, out
     
     # --- PLOT A: The Strict Binary Map ---
     plt.figure(figsize=(10, 8))
-    # 1 = Source (R0 > 1), 0 = Sink (R0 <= 1)
     binary_map = (R0_masked > 1.0).astype(float)
-    cmap_binary = mcolors.ListedColormap(['#d73027', '#4575b4']) # Red, Blue
-    
+    cmap_binary = mcolors.ListedColormap(['#d73027', '#4575b4']) 
     plt.imshow(binary_map, cmap=cmap_binary, origin='upper')
     
-    # Custom Legend
     import matplotlib.patches as mpatches
     legend_elements = [
         mpatches.Patch(color='#4575b4', label='Source ($R_0 > 1$)'),
@@ -419,22 +558,15 @@ def analyze_source_sink_mortality(data, Sa_grid, Sj_grid, Fmax_grid, Q_grid, out
 
     # --- PLOT B: The Principled Core vs. Marginal Map ---
     plt.figure(figsize=(10, 8))
+    upper_thresh, lower_thresh = 1.1, 0.9
     
-    # Define thresholds (e.g., +/- 10% deviation from replacement)
-    upper_thresh = 1.1
-    lower_thresh = 0.9
-    
-    # 0 = Core Sink, 1 = Marginal, 2 = Core Source
     ternary_map = np.zeros_like(R0_masked)
     ternary_map = np.where(R0_masked > upper_thresh, 2, ternary_map)
     ternary_map = np.where((R0_masked >= lower_thresh) & (R0_masked <= upper_thresh), 1, ternary_map)
     ternary_map = np.where(R0_masked < lower_thresh, 0, ternary_map)
     
     ternary_masked = np.ma.masked_where(land_mask == 0, ternary_map)
-    
-    # Red (Sink), Light Grey (Marginal), Blue (Source)
     cmap_ternary = mcolors.ListedColormap(['#d73027', '#e0e0e0', '#4575b4'])
-    
     plt.imshow(ternary_masked, cmap=cmap_ternary, origin='upper')
     
     legend_elements_ternary = [
@@ -448,21 +580,56 @@ def analyze_source_sink_mortality(data, Sa_grid, Sj_grid, Fmax_grid, Q_grid, out
     plt.savefig(os.path.join(output_dir, "analysis_source_sink_core.png"), dpi=200)
     plt.close()
 
+    # --- RESTORED PLOT C: MIGRANT RISK VIA CROSS-CORRELATION ---
+    print("Calculating true path-integrated outgoing risk...")
+    
+    if Q_grid.ndim == 4:
+        Q_spatial = np.mean(Q_grid, axis=0) # (Ny, Nx, K)
+    else:
+        Q_spatial = Q_grid
+        
+    k_stack_fft = data['juvenile_fft_kernel_stack'] # (K, Ly, Lx)
+    edge_corr = data['juvenile_edge_correction_stack'] # (K, Ny, Nx)
+    
+    Ny, Nx, num_k = Q_spatial.shape
+    Ly, Lx = k_stack_fft.shape[1], k_stack_fft.shape[2]
+    pad_y, pad_x = Ly - Ny, Lx - Nx
+    
+    expected_survivals = []
+    
+    for k in range(num_k):
+        Q_k = Q_spatial[..., k] * land_mask
+        Q_k_pad = jnp.pad(Q_k, ((0, pad_y), (0, pad_x)), mode='constant', constant_values=0.0)
+        
+        Q_k_fft = jnp.fft.fft2(Q_k_pad)
+        cross_corr = jnp.real(jnp.fft.ifft2(Q_k_fft * jnp.conj(k_stack_fft[k])))
+        
+        Q_k_pulled = cross_corr[:Ny, :Nx]
+        Q_k_expected = Q_k_pulled / (edge_corr[k] + 1e-6)
+        expected_survivals.append(Q_k_expected)
+        
+    avg_expected_survival = jnp.mean(jnp.stack(expected_survivals, axis=0), axis=0)
+    mortality = 1.0 - avg_expected_survival
+    risk_masked = np.ma.masked_where(land_mask == 0, mortality)
+    
+    plt.figure(figsize=(10, 8))
+    plt.imshow(risk_masked, cmap='YlOrRd', origin='upper', vmin=0, vmax=1)
+    plt.title("Juvenile Migrant Risk\n(Average Mortality for Dispersers Leaving Pixel)")
+    plt.colorbar(label="Probability of Death During Dispersal")
+    plt.axis('off')
+    plt.savefig(os.path.join(output_dir, "analysis_migrant_risk.png"), dpi=200)
+    plt.close()
+
 def plot_spatial_residuals(obs_grid, density, output_dir, land_mask):
     print("Generating Spatial Residual Map...")
     
-    # Use log1p to handle zeros and massive population variances smoothly
     log_obs = np.log1p(obs_grid)
     log_pred = np.log1p(density)
     
-    # Residual = Observation - Prediction
-    # Positive (Red) = We under-predicted (Birds are there, model says no)
-    # Negative (Blue) = We over-predicted (Model says birds are there, they aren't)
     diff = log_obs - log_pred
     
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        # Average the residuals across all time steps
         mean_resid = np.nanmean(diff, axis=0)
         
     mean_resid = np.ma.masked_where(land_mask == 0, mean_resid)
@@ -476,27 +643,75 @@ def plot_spatial_residuals(obs_grid, density, output_dir, land_mask):
     plt.savefig(os.path.join(output_dir, "diagnostics_spatial_residuals.png"), dpi=200)
     plt.close()
 
+def diagnose_st_weights(sim, data, output_dir):
+    print("Diagnosing Spatio-Temporal Regularization (Spatial Confounding)...")
+    st_weights = sim['st_weights']
+    
+    # Extract the environmental survival weights
+    beta_s = sim['w_env'][:, 0]
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    
+    # --- PANEL 1: Sparsity Check (The Histogram) ---
+    # We use a log-scale on the y-axis because a healthy Laplace prior 
+    # will have 95% of its weights pinned exactly at 0.0
+    axes[0].hist(st_weights, bins=50, color='purple', edgecolor='black', log=True)
+    axes[0].set_title("Distribution of Spatio-Temporal Weights\n(Healthy = Massive spike at 0)")
+    axes[0].set_xlabel("Learned Weight Value")
+    axes[0].set_ylabel("Frequency (Log Scale)")
+    
+    # --- PANEL 2: Variance Share (The Spatial Impact) ---
+    # We evaluate a representative middle year to check the spatial magnitude
+    t_idx = data['time'] // 2
+    
+    # Pull data arrays for that year
+    z_t = np.array(data['Z_gathered'][t_idx]) 
+    st_basis_t = np.array(data['st_basis'][:, t_idx, :]) 
+    
+    # Reconstruct the two competing spatial fields
+    H_env = np.dot(z_t, beta_s)                     # The Biology
+    H_st = np.dot(st_basis_t.T, st_weights)         # The Mathematical Noise
+    
+    # Calculate how much "energy" (standard deviation) is in each field
+    std_env = np.std(H_env)
+    std_st = np.std(H_st)
+    
+    bars = axes[1].bar(
+        ['Environmental Features\n(Climate & Land)', 'Spatio-Temporal Noise\n(The Escape Hatch)'], 
+        [std_env, std_st], 
+        color=['forestgreen', 'gray']
+    )
+    axes[1].set_title("Variance Contribution to Latent Manifold")
+    axes[1].set_ylabel("Standard Deviation of Spatial Field")
+    
+    # Annotate the Noise-to-Signal ratio
+    ratio = std_st / (std_env + 1e-9)
+    axes[1].text(0.5, max(std_env, std_st) * 0.9, f"Noise-to-Signal Ratio: {ratio:.2f}x", 
+                 ha='center', va='top', fontsize=12, bbox=dict(facecolor='white', alpha=0.9))
+                 
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "diagnostics_st_weights_impact.png"), dpi=200)
+    plt.close()
+
 # --- MAIN ---
 
 def plot_results():
+    # UPDATED: Loaded data FIRST to fix NameError for K_kernels fallback
+    data = load_data_to_gpu(INPUT_DIR, precision=PRECISION)
+    with open(os.path.join(RESULT_DIR, "map_params.pkl"), 'rb') as f: params = pickle.load(f)
+
     # --- Load Kernel Labels ---
-    # Update this path to wherever your path integration .npz files live
     PATH_INTEGRATION_DIR = "/home/breallis/processed_data/datasets/latent_avian_path_diagnostics"
     disp_files = glob.glob(os.path.join(PATH_INTEGRATION_DIR, "Z_disp_*.npz"))
     
     if not disp_files:
         print("Warning: No Z_disp files found. Labels will be generic.")
-        # Fallback assuming you have K kernels (find K from Q_grid shape)
         K_kernels = data['juvenile_fft_kernel_stack'].shape[0]
         labels = [f"Kernel_{i}" for i in range(K_kernels)] 
     else:
         with np.load(disp_files[0]) as loader:
-            # np.load returns numpy arrays; convert to a standard Python list of strings
             labels = [str(lbl) for lbl in loader['labels']]
     # --------------------------
-
-    data = load_data_to_gpu(INPUT_DIR, precision=PRECISION)
-    with open(os.path.join(RESULT_DIR, "map_params.pkl"), 'rb') as f: params = pickle.load(f)
 
     # 1. Standard Run
     sim = reconstruct_simulation(data, params)
@@ -505,12 +720,25 @@ def plot_results():
     params_no_inv = params.copy()
     inv_key = 'inv_eta_auto_loc' 
     if inv_key in params_no_inv:
-        # Set to -100 so softplus(-100) is effectively 0.0
         params_no_inv[inv_key] = jnp.full_like(params_no_inv[inv_key], -100.0)
     else:
         print(f"Key {inv_key} not found. Available keys: {list(params_no_inv.keys())}")
 
     sim_cf = reconstruct_simulation(data, params_no_inv)
+
+    # 2. Diagnostic Counter-Factual (No Invasion + No Spatial Noise)
+    params_diagnostic = params.copy()
+    
+    # Disable invasion
+    inv_key = 'inv_eta_auto_loc' 
+    if inv_key in params_diagnostic:
+        params_diagnostic[inv_key] = jnp.full_like(params_diagnostic[inv_key], -100.0)
+        
+    # ZERO OUT THE SPATIAL "ESCAPE HATCH"
+    params_diagnostic['st_weights_auto_loc'] = jnp.zeros_like(params_diagnostic['st_weights_auto_loc'])
+    
+    # Run simulation with original data but silenced weights
+    sim_diagnostic = reconstruct_simulation(data, params_diagnostic)
     
     Ny, Nx = data['Ny'], data['Nx']
     rows, cols = data['land_rows'], data['land_cols']
@@ -519,6 +747,7 @@ def plot_results():
     # Extract Total Densities
     density = np.array(sim['simulated_density']) * data['pop_scalar']
     density_cf = np.array(sim_cf['simulated_density']) * data['pop_scalar']
+    density_cf_diag = np.array(sim_diagnostic['simulated_density']) * data['pop_scalar']
     
     # Map 1D arrays back to 2D Spatial Grids
     Sa_grid = scatter_to_grid_robust(np.array(sim['Sa_flat']), rows, cols, (Ny, Nx))
@@ -535,6 +764,19 @@ def plot_results():
     Na_grid, Nj_grid = rebuild_age_pools(sim, data, params)
 
     # --- Execute Diagnostics ---
+
+    # Original Animations
+    create_animation(density_cf_diag, obs_grid, years, OUTPUT_PLOT_DIR, data['land_mask'], "evolution_counterfactual_diagnostic_logscale.mp4", logscale=True)
+    create_animation(density_cf_diag, obs_grid, years, OUTPUT_PLOT_DIR, data['land_mask'], "evolution_counterfactual_diagnostic.mp4")
+    create_animation(density, obs_grid, years, OUTPUT_PLOT_DIR, data['land_mask'])
+    create_animation(density_cf, obs_grid, years, OUTPUT_PLOT_DIR, data['land_mask'], "evolution_counterfactual.mp4")
+
+    # New Temporal Analysis
+    diagnose_st_weights(sim, data, OUTPUT_PLOT_DIR)
+    plot_demographic_timeseries(data, years[start_idx:], Sa_grid[start_idx:], Sj_grid[start_idx:], Fmax_grid[start_idx:], K_grid[start_idx:], OUTPUT_PLOT_DIR)
+    plot_habitat_shift_map(data, Sa_grid[start_idx:], Sj_grid[start_idx:], Fmax_grid[start_idx:], OUTPUT_PLOT_DIR)
+
+    explore_manifold_correlation(sim, Sj_grid[start_idx:], Fmax_grid[start_idx:], OUTPUT_PLOT_DIR, data['land_mask'])
     plot_spatial_residuals(obs_grid, density, OUTPUT_PLOT_DIR, data['land_mask'])
     plot_directional_asymmetry(data, Sa_grid[start_idx:], Sj_grid[start_idx:], Fmax_grid[start_idx:], Q_grid[start_idx:], labels, OUTPUT_PLOT_DIR)
 
@@ -543,9 +785,7 @@ def plot_results():
     plot_age_structure_dynamics(Na_grid, Nj_grid, years, OUTPUT_PLOT_DIR, data['land_mask'])
     analyze_source_sink_mortality(data, Sa_grid[start_idx:], Sj_grid[start_idx:], Fmax_grid[start_idx:], Q_grid[start_idx:], OUTPUT_PLOT_DIR)
 
-    # Original Animations
-    create_animation(density, obs_grid, years, OUTPUT_PLOT_DIR, data['land_mask'])
-    create_animation(density_cf, obs_grid, years, OUTPUT_PLOT_DIR, data['land_mask'], "evolution_counterfactual.mp4")
+
     
     print(f"All diagnostics complete. Results at: {OUTPUT_PLOT_DIR}")
 

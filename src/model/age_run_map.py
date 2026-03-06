@@ -9,6 +9,7 @@ from numpyro.infer import SVI, Trace_ELBO
 from numpyro.infer.autoguide import AutoDelta
 from numpyro.optim import Adam
 import matplotlib.pyplot as plt
+import optax
 
 # --- SINGLE POINT OF CONTROL ---
 PRECISION = 'float32' # Options: 'float32' or 'float64'
@@ -27,7 +28,7 @@ from src.model.age_priors import build_model_2d
 # --- CONFIGURATION ---
 INPUT_DIR = "/home/breallis/processed_data/model_inputs/numpyro_input"
 # Updated output directory to separate the age-structured results
-OUTPUT_DIR = f"/home/breallis/processed_data/model_results/age_map_{PRECISION}_run_01"
+OUTPUT_DIR = f"/home/breallis/processed_data/model_results/age_map_{PRECISION}_run_09"
 
 def load_data_to_gpu(input_dir, precision='float32'):
     meta_path = os.path.join(input_dir, "metadata.pkl")
@@ -89,15 +90,26 @@ def run_map():
     data_dict = load_data_to_gpu(INPUT_DIR, precision=PRECISION)
 
     guide = AutoDelta(build_model_2d)
-    optimizer = Adam(step_size=0.001) 
+
+    # 1. Define your total training iterations (e.g., your full SVI run)
+    total_steps = 10000 
+
+    # 2. Create the Cosine Decay scheduler
+    scheduler = optax.cosine_decay_schedule(
+        init_value=0.01,        # Your starting learning rate
+        decay_steps=total_steps, # The length of the curve
+        alpha=0.01              # The final rate as a fraction of the init_value (0.01 * 0.01 = 0.0001)
+    )
+
+    # 3. Pass the scheduler directly into Adam just like a float
+    optimizer = Adam(step_size=scheduler)
     svi = SVI(build_model_2d, guide, optimizer, loss=Trace_ELBO())
     
     print("Compiling model...")
     rng_key = jax.random.PRNGKey(41)
-    num_steps = 10000
     
     # Ensure anneal is passed correctly
-    svi_result = svi.run(rng_key, num_steps, data=data_dict, anneal=1.0, progress_bar=True)
+    svi_result = svi.run(rng_key, total_steps, data=data_dict, anneal=1.0, progress_bar=True)
     
     # Save results to a precision-specific folder
     os.makedirs(OUTPUT_DIR, exist_ok=True)

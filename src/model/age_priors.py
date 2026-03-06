@@ -10,16 +10,26 @@ def sample_priors(anneal=1.0, M_features=None, N_basis=None, time=None):
     priors = {}
     
     # --- 1. CORRELATED 2D HABITAT MANIFOLD WEIGHTS ---
-    # LKJ Cholesky prior for correlation between Survival and Reproduction environments
-    # concentration=2.0 gently pushes the prior toward a diagonal matrix to prevent 
-    # assuming perfect correlation before seeing the data.
-    L_corr = numpyro.sample("L_corr", dist.LKJCholesky(dimension=2, concentration=2.0))
-    w_scale = numpyro.sample("w_scale", dist.HalfNormal(1.0).expand([2]))
     
-    # Scale the correlation matrix by the variance
+    # 1. Sample rho explicitly with a strong positive prior (e.g., centered at +0.7).
+    # We bound it strictly between -0.99 and 0.99 to prevent NaN errors in the Cholesky math.
+    rho = numpyro.sample("rho", dist.TruncatedNormal(loc=0.7, scale=0.2, low=-0.99, high=0.99))
+    
+    # 2. Manually construct the Cholesky factor of a 2x2 correlation matrix
+    # The Cholesky decomposition of [[1, rho], [rho, 1]] is analytically:
+    L_corr_matrix = jnp.array([
+        [1.0, 0.0],
+        [rho, jnp.sqrt(1.0 - rho**2)]
+    ])
+    
+    # Save L_corr as a deterministic site so your visualization script doesn't break
+    L_corr = numpyro.deterministic("L_corr", L_corr_matrix)
+    
+    # 3. Scale the correlation matrix by the variance
+    w_scale = numpyro.sample("w_scale", dist.HalfNormal(0.5).expand([2]))
     L_cov = w_scale[..., None] * L_corr
     
-    # Draw the correlated weights for all M features
+    # 4. Draw the correlated weights for all M features
     with numpyro.plate("env_features", M_features):
         w_env = numpyro.sample(
             "w_env", 
@@ -30,8 +40,17 @@ def sample_priors(anneal=1.0, M_features=None, N_basis=None, time=None):
     priors['beta_r'] = w_env[:, 1]  # Reproductive Suitability Weights
     
     # 1D spectral weights (Spatio-temporal random effects)
-    priors['st_weights'] = numpyro.sample("st_weights", 
-                                          dist.Laplace(0.0, 1e-6 * anneal).expand([N_basis]))
+    # 1. Define the global budget for spatial noise (e.g., 0.1 allows for moderate regional tweaks)
+    global_spatial_budget = 0.0001 * anneal
+    
+    # 2. Distribute that budget dynamically 
+    dynamic_scale = global_spatial_budget / jnp.sqrt(N_basis)
+    
+    # 3. Apply the perfectly scaled L1 penalty
+    priors['st_weights'] = numpyro.sample(
+        "st_weights", 
+        dist.Laplace(0.0, dynamic_scale).expand([N_basis])
+    )
     
     # --- 2. DEMOGRAPHIC INTERCEPTS (Alphas) ---
     # Adult survival baseline > Juvenile survival baseline
@@ -49,12 +68,12 @@ def sample_priors(anneal=1.0, M_features=None, N_basis=None, time=None):
     priors['gamma_a'] = jnn.softplus(gamma_a_raw)
     priors['gamma_j'] = priors['gamma_a'] + gamma_j_diff 
     
-    priors['gamma_f'] = jnn.softplus(numpyro.sample("gamma_f_raw", dist.Normal(1.0, 0.5 * anneal)))
-    priors['gamma_k'] = jnn.softplus(numpyro.sample("gamma_k_raw", dist.Normal(1.0, 0.5 * anneal)))
+    priors['gamma_f'] = jnn.softplus(numpyro.sample("gamma_f_raw", dist.Normal(0.0, 0.5 * anneal)))
+    priors['gamma_k'] = jnn.softplus(numpyro.sample("gamma_k_raw", dist.Normal(0.0, 0.5 * anneal)))
     
     # --- 4. ALLEE & DISPERSAL SCALARS ---
-    priors['allee_intercept'] = numpyro.sample("allee_intercept", dist.Normal(0.0, 1.0 * anneal))
-    priors['allee_slope'] = jnn.softplus(numpyro.sample("allee_slope_raw", dist.Normal(1.0, 0.5 * anneal)))
+    priors['allee_intercept'] = numpyro.sample("allee_intercept", dist.Normal(-2.0, 1.0 * anneal))
+    priors['allee_slope'] = jnn.softplus(numpyro.sample("allee_slope_raw", dist.Normal(0.0, 1.0 * anneal)))
     
     priors['dispersal_logit_intercept'] = numpyro.sample("dispersal_logit_intercept", dist.Normal(2.0, 0.5 * anneal))
     priors['dispersal_logit_slope'] = numpyro.sample("dispersal_logit_slope", dist.Normal(4.0, 0.5 * anneal))
@@ -65,7 +84,7 @@ def sample_priors(anneal=1.0, M_features=None, N_basis=None, time=None):
     return priors
 
 
-def build_model_2d(data, anneal=0.1):
+def build_model_2d(data, anneal=1.0):
     Nx, Ny = data['Nx'], data['Ny']
     time = data['time']
     land_rows, land_cols = data['land_rows'], data['land_cols']
@@ -90,7 +109,7 @@ def build_model_2d(data, anneal=0.1):
     juvenile_fraction = F_mean / (F_mean + lambda_mean)
 
     # Soft constraint pulling the model's global baselines toward 50/50
-    numpyro.factor("age_structure_constraint", dist.Normal(0.5, 0.05).log_prob(juvenile_fraction))
+    numpyro.factor("age_structure_constraint", dist.Normal(0.5, 0.01).log_prob(juvenile_fraction))
 
     # 2. Compute Biological Fields (2D Manifold -> Demographic Rates)
     # Notice we now pass beta_s and beta_r instead of a single beta_h
@@ -98,7 +117,7 @@ def build_model_2d(data, anneal=0.1):
         time, Ny, Nx, land_rows, land_cols,
         data['Z_gathered'], data['Z_disp_gathered'], 
         data['st_basis'], priors['st_weights'], 
-        priors['beta_s'], priors['beta_r'],  # <--- CHANGED HERE
+        priors['beta_s'], priors['beta_r'],
         priors['alpha_a'], priors['gamma_a'],
         priors['alpha_j'], priors['gamma_j'],
         priors['alpha_f'], priors['gamma_f'],
@@ -135,4 +154,13 @@ def build_model_2d(data, anneal=0.1):
     densities_obs = jnp.maximum(densities[t_idx, rows, cols] * data["pop_scalar"], 1e-6)
     
     numpyro.deterministic("expected_obs", densities_obs)
-    numpyro.sample("obs", dist.Poisson(densities_obs), obs=data["observed_results"])
+    # You will need to define a concentration (overdispersion) parameter first
+    # A common prior for this is an Exponential or HalfNormal
+    concentration = numpyro.sample("concentration", dist.Exponential(1.0))
+
+    # Replace Poisson with NegativeBinomial2
+    numpyro.sample(
+        "obs", 
+        dist.NegativeBinomial2(mean=densities_obs, concentration=concentration), 
+        obs=data["observed_results"]
+    )
