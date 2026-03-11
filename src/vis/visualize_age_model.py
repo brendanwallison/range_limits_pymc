@@ -5,6 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import matplotlib.colors as mcolors
+import matplotlib.patches as mpatches
 import jax
 import jax.numpy as jnp
 import jax.nn as jnn
@@ -13,7 +14,8 @@ from numpyro.infer import Predictive
 from numpyro.infer.autoguide import AutoDelta
 import warnings
 import glob
-    
+
+
 # --- Setup Paths ---
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))
 if project_root not in sys.path:
@@ -28,13 +30,329 @@ PRECISION = 'float32'
 jax.config.update("jax_enable_x64", True if PRECISION == 'float64' else False)
 
 INPUT_DIR = "/home/breallis/processed_data/model_inputs/numpyro_input"
-RESULT_DIR = f"/home/breallis/processed_data/model_results/age_map_{PRECISION}_run_09"
+RESULT_DIR = f"/home/breallis/processed_data/model_results/age_map_{PRECISION}_run_10"
 OUTPUT_PLOT_DIR = os.path.join(RESULT_DIR, "plots_analysis")
 os.makedirs(OUTPUT_PLOT_DIR, exist_ok=True)
 
-# --- DATA & RECONSTRUCTION ---
+# --- 1. DIRECT POSTERIORS (MAP ESTIMATES) ---
+def plot_posterior_weights(sim, M, z_names, output_dir):
+    """Plots the MAP point estimates for beta_s and beta_r."""
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    # Extract exact MAP point estimates (no averaging needed)
+    bs_map = sim['beta_s']
+    br_map = sim['beta_r']
+    
+    y_pos = np.arange(M)
+    
+    # 1. Draw the connecting dotted lines FIRST so they stay in the background (zorder=1)
+    for i in range(M):
+        ax.plot([bs_map[i], br_map[i]], [y_pos[i], y_pos[i]], 
+                color='gray', linestyle=':', alpha=0.7, zorder=1)
+    
+    # 2. Plot Survival Weights (no error bars for MAP)
+    ax.scatter(bs_map, y_pos, color='dodgerblue', label='Survival (beta_s)', 
+               marker='o', s=64, zorder=3)
+    
+    # 3. Plot Reproductive Weights
+    ax.scatter(br_map, y_pos, color='darkorange', label='Reproduction (beta_r)', 
+               marker='s', s=64, zorder=2)
+    
+    ax.axvline(0, color='black', linestyle='-', alpha=0.3, zorder=0)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(z_names)
+    ax.set_xlabel("MAP Weight Estimate")
+    ax.set_title("Environmental Profile: Survival vs. Reproduction (MAP)")
+    
+    # Add a little padding to the top and bottom
+    ax.set_ylim(-0.5, M - 0.5)
+    
+    ax.legend()
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "1_posterior_weights_map.png"), dpi=300)
+    plt.close()
 
-import matplotlib.patches as mpatches
+# --- 2. DEMOGRAPHIC RESPONSE CURVES ---
+def plot_demographic_response_curves(sim, M, z_names, target_z_idx, output_dir):
+    """Sweeps a target Z axis to show the non-linear biological response."""
+    z_sweep = np.linspace(-3, 3, 100)
+    
+    Z_matrix = np.zeros((100, M))
+    Z_matrix[:, target_z_idx] = z_sweep
+    
+    # Extract direct MAP estimates
+    alpha_a = sim['alpha_a']
+    alpha_j = sim['alpha_j']
+    alpha_f = sim['alpha_f']
+    
+    gamma_a = float(jnn.softplus(sim['gamma_a_raw']))
+    gamma_j = gamma_a + sim['gamma_j_diff']
+    gamma_f = float(jnn.softplus(sim['gamma_f_raw']))
+    
+    bs = sim['beta_s']
+    br = sim['beta_r']
+    
+    H_s = Z_matrix @ bs
+    H_r = Z_matrix @ br
+    
+    S_a = jnn.sigmoid(alpha_a + gamma_a * H_s)
+    S_j = jnn.sigmoid(alpha_j + gamma_j * H_s)
+    F_max = jnp.exp(alpha_f + gamma_f * H_r)
+    
+    fig, ax1 = plt.subplots(figsize=(8, 6))
+    
+    ax1.plot(z_sweep, S_a, color='navy', linewidth=2, label='Adult Survival (S_a)')
+    ax1.plot(z_sweep, S_j, color='royalblue', linewidth=2, linestyle='--', label='Juvenile Survival (S_j)')
+    ax1.set_xlabel(f"{z_names[target_z_idx]} Gradient (Standardized)")
+    ax1.set_ylabel("Annual Survival Probability", color='navy')
+    ax1.set_ylim(0, 1.0)
+    ax1.tick_params(axis='y', labelcolor='navy')
+    
+    ax2 = ax1.twinx()
+    ax2.plot(z_sweep, F_max, color='darkorange', linewidth=2, label='Max Fecundity (F_max)')
+    ax2.set_ylabel("Maximum Fecundity", color='darkorange')
+    ax2.tick_params(axis='y', labelcolor='darkorange')
+    
+    lines_1, labels_1 = ax1.get_legend_handles_labels()
+    lines_2, labels_2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='upper left')
+    
+    plt.title(f"Demographic Response to {z_names[target_z_idx]}")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, f"2_response_curve_{z_names[target_z_idx]}.png"), dpi=300)
+    plt.close()
+
+# --- 3. ENVIRONMENTAL DRIVERS AND LIMITS (TEMPORAL EPOCHS) ---
+def plot_environmental_drivers_and_limits(sim, data, M, z_names, output_dir):
+    """Maps the Z features acting as the primary drivers (+) and limits (-) across two eras."""
+    print("   -> Calculating Temporal Epochs (1970-1975 vs 2018-2023)...")
+    bs = sim['beta_s']
+    br = sim['beta_r']
+    
+    Z_gathered = data['Z_gathered']
+    years = data['years']
+    
+    idx_early = np.where((years >= 1970) & (years <= 1975))[0]
+    idx_late = np.where((years >= 2018) & (years <= 2023))[0]
+    
+    if Z_gathered.ndim >= 3:
+        Z_early = np.mean(Z_gathered[idx_early], axis=0) # Time averaging remains
+        Z_late = np.mean(Z_gathered[idx_late], axis=0)
+    else:
+        Z_early = Z_late = Z_gathered
+        
+    cont_s_early, cont_r_early = Z_early * bs, Z_early * br
+    cont_s_late, cont_r_late = Z_late * bs, Z_late * br
+    
+    limits = {
+        'S_early': np.argmin(cont_s_early, axis=-1), 'S_late': np.argmin(cont_s_late, axis=-1),
+        'R_early': np.argmin(cont_r_early, axis=-1), 'R_late': np.argmin(cont_r_late, axis=-1)
+    }
+    drivers = {
+        'S_early': np.argmax(cont_s_early, axis=-1), 'S_late': np.argmax(cont_s_late, axis=-1),
+        'R_early': np.argmax(cont_r_early, axis=-1), 'R_late': np.argmax(cont_r_late, axis=-1)
+    }
+    
+    def _to_grid(flat_idx):
+        if flat_idx.ndim == 1:
+            grid = np.full((data['Ny'], data['Nx']), np.nan)
+            grid[data['land_rows'], data['land_cols']] = flat_idx
+            return grid
+        return np.where(data['land_mask'] == 1, flat_idx, np.nan)
+
+    cmap = plt.get_cmap('tab20', M)
+    patches = [mpatches.Patch(color=cmap(i), label=z_names[i]) for i in range(M)]
+
+    def _render_2x2_grid(data_dict, title_prefix, filename):
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        
+        axes[0, 0].imshow(_to_grid(data_dict['S_early']), cmap=cmap, origin='upper', vmin=-0.5, vmax=M-0.5)
+        axes[0, 0].set_title("Survival ($S_a, S_j$) | 1970-1975", fontsize=14)
+        axes[0, 0].axis('off')
+        
+        axes[0, 1].imshow(_to_grid(data_dict['R_early']), cmap=cmap, origin='upper', vmin=-0.5, vmax=M-0.5)
+        axes[0, 1].set_title("Reproduction ($F_{max}$) | 1970-1975", fontsize=14)
+        axes[0, 1].axis('off')
+        
+        axes[1, 0].imshow(_to_grid(data_dict['S_late']), cmap=cmap, origin='upper', vmin=-0.5, vmax=M-0.5)
+        axes[1, 0].set_title("Survival ($S_a, S_j$) | 2018-2023", fontsize=14)
+        axes[1, 0].axis('off')
+        
+        axes[1, 1].imshow(_to_grid(data_dict['R_late']), cmap=cmap, origin='upper', vmin=-0.5, vmax=M-0.5)
+        axes[1, 1].set_title("Reproduction ($F_{max}$) | 2018-2023", fontsize=14)
+        axes[1, 1].axis('off')
+        
+        fig.legend(handles=patches, bbox_to_anchor=(0.5, 0.02), loc='lower center', 
+                   ncol=min(M, 6), title=f"Primary Environmental {title_prefix}", fontsize=12, title_fontsize=14)
+        
+        plt.suptitle(f"Spatial {title_prefix} Factors: Historical vs. Modern Era", fontsize=18, y=0.96)
+        plt.tight_layout(rect=[0, 0.08, 1, 0.95])
+        plt.savefig(os.path.join(output_dir, filename), dpi=300)
+        plt.close()
+
+    _render_2x2_grid(limits, "Limiting", "3_limiting_factors_temporal.png")
+    _render_2x2_grid(drivers, "Driving", "4_driving_factors_temporal.png")
+
+# --- 4. CONTINENTAL AGGREGATE IMPACTS (VIOLINS ONLY) ---
+def plot_continental_aggregates(sim, data, M, z_names, output_dir):
+    print("   -> Calculating Continental Impact Distributions (Violins)...")
+    
+    Z_gathered = data['Z_gathered']
+    if Z_gathered.ndim >= 3:
+        Z_modern = np.mean(Z_gathered[-10:], axis=0) 
+    else:
+        Z_modern = Z_gathered
+        
+    bs = sim['beta_s']
+    br = sim['beta_r']
+    
+    cont_s = Z_modern * bs
+    cont_r = Z_modern * br
+    
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8), sharey=True)
+    y_pos = np.arange(M)
+    
+    def plot_violins(ax, data_matrix, title, color):
+        parts = ax.violinplot(
+            dataset=[data_matrix[:, i] for i in range(M)],
+            positions=y_pos,
+            vert=False,
+            widths=0.7,
+            showmeans=True,
+            showextrema=False
+        )
+        for pc in parts['bodies']:
+            pc.set_facecolor(color)
+            pc.set_alpha(0.5)
+        parts['cmeans'].set_color('black')
+        ax.axvline(0, color='red', linestyle='--', alpha=0.5)
+        ax.set_title(title, fontsize=14)
+        ax.set_xlabel("Linear Contribution ($Z_k \\times \\beta_k$)")
+
+    plot_violins(axes[0], cont_s, "Spatial Impact on Survival", "dodgerblue")
+    plot_violins(axes[1], cont_r, "Spatial Impact on Reproduction", "darkorange")
+    
+    axes[0].set_yticks(y_pos)
+    axes[0].set_yticklabels(z_names, fontsize=12)
+    plt.suptitle("Continental Environmental Impacts (Modern Era Average)", fontsize=18, fontweight='bold', y=0.98)
+    
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(os.path.join(output_dir, "4_continental_impacts_violins.png"), dpi=300)
+    plt.close()
+
+
+# --- 5. SPATIAL R0 ABLATION (THE KEYSTONE MAP) ---
+def plot_R0_ablation_keystone(sim, data, M, z_names, output_dir):
+    print("   -> Calculating Spatial R0 Ablation and Keystone Features...")
+    
+    Z_gathered = data['Z_gathered']
+    if Z_gathered.ndim >= 3:
+        Z_modern = np.mean(Z_gathered[-10:], axis=0) 
+    else:
+        Z_modern = Z_gathered
+        
+    bs = sim['beta_s']
+    br = sim['beta_r']
+    
+    alpha_a = sim['alpha_a']
+    alpha_j = sim['alpha_j']
+    alpha_f = sim['alpha_f']
+    
+    gamma_a = float(jnn.softplus(sim['gamma_a_raw']))
+    gamma_j = gamma_a + sim['gamma_j_diff']
+    gamma_f = float(jnn.softplus(sim['gamma_f_raw']))
+    
+    # In plot_R0_ablation_keystone:
+    def calc_R0(Z_matrix):
+        H_s = Z_matrix @ bs
+        H_r = Z_matrix @ br
+        S_a = jnn.sigmoid(alpha_a + gamma_a * H_s)
+        S_j = jnn.sigmoid(alpha_j + gamma_j * H_s)
+        F_max = jnp.exp(alpha_f + gamma_f * H_r)
+        
+        # This represents the 'Biotic Potential' without the Allee bottleneck
+        return (F_max * S_j) / (1.0 - S_a + 1e-6)
+
+    baseline_R0 = calc_R0(Z_modern)
+    
+    delta_R0_spatial = np.zeros((M, len(Z_modern)))
+    
+    for i in range(M):
+        Z_ablated = Z_modern.copy()
+        Z_ablated[:, i] = 0.0  
+        delta_R0_spatial[i] = baseline_R0 - calc_R0(Z_ablated)
+        
+    net_impact = np.mean(delta_R0_spatial, axis=1)          
+    abs_impact = np.mean(np.abs(delta_R0_spatial), axis=1)  
+    
+    keystone_idx = np.argmax(np.abs(delta_R0_spatial), axis=0)
+    
+    if keystone_idx.ndim == 1:
+        grid_keystone = np.full((data['Ny'], data['Nx']), np.nan)
+        grid_keystone[data['land_rows'], data['land_cols']] = keystone_idx
+    else:
+        grid_keystone = np.where(data['land_mask'] == 1, keystone_idx, np.nan)
+
+    fig, axes = plt.subplots(1, 2, figsize=(20, 8), gridspec_kw={'width_ratios': [1, 1.2]})
+    
+    y_pos = np.arange(M)
+    
+    axes[0].barh(y_pos, abs_impact, color='lightgray', edgecolor='black', 
+                 label='Mean Absolute Impact (Local Volatility)')
+    
+    colors = ['forestgreen' if val > 0 else 'firebrick' for val in net_impact]
+    axes[0].barh(y_pos, net_impact, color=colors, height=0.5, alpha=0.9, 
+                 label='Net Continental Impact (Direction)')
+    
+    axes[0].axvline(0, color='black', linestyle='-')
+    axes[0].set_yticks(y_pos)
+    axes[0].set_yticklabels(z_names, fontsize=12)
+    axes[0].set_xlabel("Change in $R_0$")
+    axes[0].set_title("Biological Leverage:\nLocal Volatility vs. Net Continental Impact", fontsize=15)
+    axes[0].legend(loc='lower right')
+
+    cmap = plt.get_cmap('tab20', M)
+    im = axes[1].imshow(grid_keystone, cmap=cmap, origin='upper', vmin=-0.5, vmax=M-0.5)
+    axes[1].axis('off')
+    axes[1].set_title("The Keystone Feature Map\n(Feature causing largest absolute $\Delta R_0$ if removed)", fontsize=15)
+    
+    patches = [mpatches.Patch(color=cmap(i), label=z_names[i]) for i in range(M)]
+    axes[1].legend(handles=patches, bbox_to_anchor=(1.05, 1), loc='upper left', title="Keystone Feature")
+
+    plt.suptitle("Total Environmental Impact on Population Replacement ($R_0$)", fontsize=18, fontweight='bold', y=0.98)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(os.path.join(output_dir, "5_R0_ablation_keystone.png"), dpi=300)
+    plt.close()
+
+# --- MASTER SUITE CONTROLLER ---
+def characterize_Z_dependence_suite(sim, data, output_dir, z_names=None):
+    print("Initializing Z-Dependence Characterization Suite...")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    Z_gathered = data['Z_gathered'] 
+    M = Z_gathered.shape[-1]
+    
+    if z_names is None:
+        z_names = [f"Z_{i}" for i in range(M)]
+        
+    print("1. Generating Posterior Profiles...")
+    plot_posterior_weights(sim, M, z_names, output_dir)
+    
+    print("2. Generating Demographic Response Curves...")
+    for target_idx in range(min(3, M)):
+        plot_demographic_response_curves(sim, M, z_names, target_idx, output_dir)
+        
+    print("3. Generating Environmental Drivers and Limits Maps...")
+    plot_environmental_drivers_and_limits(sim, data, M, z_names, output_dir)
+
+    print("4. Generating Continental Impact Distributions (Violins)...")
+    plot_continental_aggregates(sim, data, M, z_names, output_dir)
+    
+    print("5. Generating Spatial R0 Keystone Map & Ablation...")
+    plot_R0_ablation_keystone(sim, data, M, z_names, output_dir)
+    
+    print(f"Suite complete. Visualizations saved to {output_dir}")
 
 def _render_comparison_plot(data, grid_a, grid_b, title, filename, output_dir, labels_ab=("A", "B")):
     """
@@ -220,14 +538,16 @@ def reconstruct_simulation(data, params):
     model = build_model_2d
     guide = AutoDelta(model)
     
-    # UPDATED: Replaced beta_s/beta_r with the actual sampled sites w_env and L_corr
+    # Change these lines in reconstruct_simulation:
     return_sites = [
         "simulated_density", "Sa_flat", "Sj_flat", "Fmax_flat", "K_flat", "Q_flat", "expected_obs",
         "st_weights", "w_env", "L_corr", "dispersal_random",
         "dispersal_logit_intercept", "dispersal_logit_slope",
-        "allee_intercept", "allee_slope_raw",
-        "alpha_a", "alpha_j", "alpha_f", "alpha_k"
+        "n50_raw", "allee_gamma",
+        "alpha_a", "alpha_j", "alpha_f", "alpha_k",
+        "gamma_a_raw", "gamma_j_diff", "gamma_f_raw"
     ]
+
     
     predictive = Predictive(model, guide=guide, params=params, num_samples=1, return_sites=return_sites)
     rng_key = jax.random.PRNGKey(0)
@@ -256,24 +576,28 @@ def rebuild_age_pools(sim, data, params):
     time = data['time']
     Ny, Nx = data['Ny'], data['Nx']
     row, col = data['inv_location']
+    
+    # Use the _auto_loc suffix for parameters sampled directly in the model
     inv_pop = jnn.softplus(params['inv_eta_auto_loc'])
     
-    allee_scalar = data['pop_scalar'] * jnn.softplus(params['allee_slope_raw_auto_loc'])
-    allee_int = params['allee_intercept_auto_loc']
+    # Pull the pre-scaled, pre-transformed gamma directly from the sim dict
+    # This was saved via numpyro.deterministic("allee_gamma", ...)
+    allee_gamma = sim['allee_gamma'] 
+    
+    # Pull dispersal parameters (standardizing the suffix usage)
     disp_log_int = params['dispersal_logit_intercept_auto_loc']
     disp_log_slope = params['dispersal_logit_slope_auto_loc']
-    disp_random = sim['dispersal_random']
 
     def step(pools, t):
         N_a, N_j = pools
         
-        # Invasion
+        # 1. Invasion logic
         k = t - data['inv_timestep']
         is_invading = (k >= 0) & (k < inv_pop.shape[0])
-        val = jnp.where(is_invading, inv_pop[jnp.minimum(jnp.maximum(0, k), inv_pop.shape[0]-1)], 0.0)
+        val = jnp.where(is_invading, inv_pop[jnp.clip(k, 0, inv_pop.shape[0]-1)], 0.0)
         N_a = N_a.at[row, col].add(val)
 
-        # Scatter params
+        # 2. Scatter params (Pulling from the reconstructed sim fields)
         Sa_g = jnp.zeros((Ny, Nx)).at[data['land_rows'], data['land_cols']].set(sim['Sa_flat'][t])
         Sj_g = jnp.zeros((Ny, Nx)).at[data['land_rows'], data['land_cols']].set(sim['Sj_flat'][t])
         Fmax_g = jnp.zeros((Ny, Nx)).at[data['land_rows'], data['land_cols']].set(sim['Fmax_flat'][t])
@@ -283,7 +607,7 @@ def rebuild_age_pools(sim, data, params):
         Q_temp = jnp.zeros((Ny, Nx, Q_t.shape[-1])).at[data['land_rows'], data['land_cols'], :].set(Q_t)
         Q_g = Q_temp.transpose(2, 0, 1)
 
-        # Disperse
+        # 3. Dispersal
         N_a_post, N_j_post = dispersal_step_age_structured(
             N_a, N_j, K_g, 
             disp_log_int, disp_log_slope, 0.8,
@@ -292,10 +616,11 @@ def rebuild_age_pools(sim, data, params):
             Q_grid=Q_g, eps=1e-6
         )
         
-        # Reproduce & Survive
+        # 4. Survival & Reproduction (The Allee-corrected step)
         N_a_new, N_j_new = reproduction_age_structured(
             N_a_post, N_j_post, Sa_g, Sj_g, Fmax_g, K_g, 
-            allee_scalar, allee_int, eps=1e-12
+            allee_gamma, # Now pre-scaled and pre-transformed
+            eps=1e-12
         )
         
         N_a_new = jnp.maximum(N_a_new * data['land_mask'], 0.0)
@@ -316,28 +641,23 @@ def plot_demographic_timeseries(data, years, Sa_grid, Sj_grid, Fmax_grid, K_grid
     land_mask = data['land_mask']
     scalar = data.get('pop_scalar', 1.0)
     
-    # Isolate valid land pixels to avoid averaging in ocean/nan values
     valid_pixels = land_mask == 1
     
-    # Calculate the mean across all land pixels for each year
     Sa_trend = np.mean(Sa_grid[:, valid_pixels], axis=1)
     Sj_trend = np.mean(Sj_grid[:, valid_pixels], axis=1)
     Fmax_trend = np.mean(Fmax_grid[:, valid_pixels], axis=1)
     K_trend = np.mean(K_grid[:, valid_pixels], axis=1) * scalar
     
-    # Global replacement rate over time
     R0_trend = (Fmax_trend * Sj_trend) / (1.0 - Sa_trend + 1e-6)
 
     fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
     
-    # Panel 1: Survival
     axes[0].plot(years, Sa_trend, label='Adult Survival ($S_a$)', color='darkblue', lw=2)
     axes[0].plot(years, Sj_trend, label='Juvenile Survival ($S_j$)', color='dodgerblue', lw=2)
     axes[0].set_ylabel("Mean Probability")
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
     
-    # Panel 2: Reproduction & Fitness
     axes[1].plot(years, Fmax_trend, label='Max Fecundity ($F_{max}$)', color='forestgreen', lw=2)
     axes[1].plot(years, R0_trend, label='Expected Replacement ($R_0$)', color='darkorange', lw=2)
     axes[1].axhline(1.0, color='red', linestyle='--', alpha=0.5, label='Stable Threshold')
@@ -345,7 +665,6 @@ def plot_demographic_timeseries(data, years, Sa_grid, Sj_grid, Fmax_grid, K_grid
     axes[1].legend()
     axes[1].grid(True, alpha=0.3)
     
-    # Panel 3: Carrying Capacity
     axes[2].plot(years, K_trend, color='purple', lw=2)
     axes[2].set_ylabel("Mean Carrying Capacity ($K$)")
     axes[2].set_xlabel("Year")
@@ -360,22 +679,17 @@ def plot_habitat_shift_map(data, Sa_grid, Sj_grid, Fmax_grid, output_dir):
     print("Mapping Historical Habitat Shifts (First vs. Last Decade)...")
     land_mask = data['land_mask']
     
-    # Calculate R0 for all spatial pixels across all time steps
     R0_grid = (Fmax_grid * Sj_grid) / (1.0 - Sa_grid + 1e-6)
     
-    # Compare early period (first 10 years) to late period (last 10 years)
-    # Using 10-year means prevents a single weird weather year from ruining the map
     early_R0 = np.mean(R0_grid[:10], axis=0)
     late_R0 = np.mean(R0_grid[-10:], axis=0)
     
     delta_R0 = late_R0 - early_R0
     masked_delta = np.ma.masked_where(land_mask == 0, delta_R0)
     
-    # Get symmetric bounds so white is exactly zero change
     v = np.nanpercentile(np.abs(masked_delta), 98) 
     
     plt.figure(figsize=(10, 8))
-    # PuOr: Purple = Improving (Sourcing), Orange = Degrading (Sinkifying)
     cmap = plt.cm.get_cmap('PuOr', 11) 
     im = plt.imshow(masked_delta, cmap=cmap, vmin=-v, vmax=v, origin='upper')
     
@@ -388,18 +702,15 @@ def plot_habitat_shift_map(data, Sa_grid, Sj_grid, Fmax_grid, output_dir):
 def explore_manifold_correlation(sim, Sj_grid, Fmax_grid, output_dir, land_mask):
     print("Exploring 2D Manifold Correlations...")
     
-    # 1. Extract the learned LKJ Correlation Matrix from the predictive simulation
     L_corr = sim['L_corr']
     corr_matrix = L_corr @ L_corr.T
     learned_rho = corr_matrix[0, 1]
         
-    # 2. Extract empirical correlation from the sampled weights matrix
     w_env = sim['w_env']
     beta_s = w_env[:, 0]
     beta_r = w_env[:, 1]
     weight_corr = np.corrcoef(beta_s, beta_r)[0, 1]
     
-    # 3. Flatten the spatial grids for the scatter plot
     Sj_avg = np.mean(Sj_grid, axis=0)
     Fmax_avg = np.mean(Fmax_grid, axis=0)
     
@@ -407,7 +718,6 @@ def explore_manifold_correlation(sim, Sj_grid, Fmax_grid, output_dir, land_mask)
     Sj_vals = Sj_avg[valid_pixels]
     Fmax_vals = Fmax_avg[valid_pixels]
     
-    # --- Plotting ---
     fig = plt.figure(figsize=(12, 6))
     
     ax_text = fig.add_subplot(121)
@@ -442,14 +752,12 @@ def plot_demographic_baselines(data, Sa_grid, Sj_grid, Fmax_grid, K_grid, output
     print("Generating Age-Structured Demographic Baselines...")
     land_mask = data['land_mask']
     
-    # Extract the scalar to convert latent K to expected real-world carrying capacity
     scalar = data.get('pop_scalar', 1.0)
     
     Sa_avg = np.mean(Sa_grid, axis=0)
     Sj_avg = np.mean(Sj_grid, axis=0)
     Fmax_avg = np.mean(Fmax_grid, axis=0)
     
-    # Scale K to represent actual expected bird counts
     K_avg = np.mean(K_grid, axis=0) * scalar
     
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
@@ -484,7 +792,6 @@ def plot_demographic_baselines(data, Sa_grid, Sj_grid, Fmax_grid, K_grid, output
 def plot_age_structure_dynamics(Na_grid, Nj_grid, years, output_dir, land_mask):
     print("Visualizing Shifting Age Structure...")
     
-    # 1. Global Time Series
     total_Na = np.sum(Na_grid, axis=(1, 2))
     total_Nj = np.sum(Nj_grid, axis=(1, 2))
     total_pop = total_Na + total_Nj + 1e-9
@@ -501,7 +808,6 @@ def plot_age_structure_dynamics(Na_grid, Nj_grid, years, output_dir, land_mask):
     plt.savefig(os.path.join(output_dir, "trend_age_structure.png"))
     plt.close()
 
-    # 2. Spatial Maps (Decadal Snapshots)
     snapshots = [1970, 1990, 2010, 2020]
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     
@@ -510,12 +816,10 @@ def plot_age_structure_dynamics(Na_grid, Nj_grid, years, output_dir, land_mask):
         na = Na_grid[t_idx]
         nj = Nj_grid[t_idx]
         
-        # Kept at 0.01 as requested
         valid_pop = (na + nj) > 0.01
         rho_spatial = np.where(valid_pop, nj / (na + nj + 1e-9), np.nan)
         rho_masked = np.ma.masked_where((land_mask == 0) | ~valid_pop, rho_spatial)
         
-        # Diverging colormap: Brown (Adult Dominated) to Green (Juvenile Dominated)
         cmap = plt.cm.get_cmap('BrBG', 11)
         im = ax.imshow(rho_masked, cmap=cmap, origin='upper', vmin=0.2, vmax=0.8)
         ax.set_title(f"Juvenile Fraction - {year}")
@@ -535,17 +839,14 @@ def analyze_source_sink_mortality(data, Sa_grid, Sj_grid, Fmax_grid, Q_grid, out
     Sj_avg = np.mean(Sj_grid, axis=0)
     Fmax_avg = np.mean(Fmax_grid, axis=0)
     
-    # 1. Calculate Expected Replacement Rate (R0)
     R0 = (Fmax_avg * Sj_avg) / (1.0 - Sa_avg + 1e-6)
     R0_masked = np.ma.masked_where(land_mask == 0, R0)
     
-    # --- PLOT A: The Strict Binary Map ---
     plt.figure(figsize=(10, 8))
     binary_map = (R0_masked > 1.0).astype(float)
     cmap_binary = mcolors.ListedColormap(['#d73027', '#4575b4']) 
     plt.imshow(binary_map, cmap=cmap_binary, origin='upper')
     
-    import matplotlib.patches as mpatches
     legend_elements = [
         mpatches.Patch(color='#4575b4', label='Source ($R_0 > 1$)'),
         mpatches.Patch(color='#d73027', label='Sink ($R_0 \leq 1$)')
@@ -556,7 +857,6 @@ def analyze_source_sink_mortality(data, Sa_grid, Sj_grid, Fmax_grid, Q_grid, out
     plt.savefig(os.path.join(output_dir, "analysis_source_sink_binary.png"), dpi=200)
     plt.close()
 
-    # --- PLOT B: The Principled Core vs. Marginal Map ---
     plt.figure(figsize=(10, 8))
     upper_thresh, lower_thresh = 1.1, 0.9
     
@@ -580,7 +880,6 @@ def analyze_source_sink_mortality(data, Sa_grid, Sj_grid, Fmax_grid, Q_grid, out
     plt.savefig(os.path.join(output_dir, "analysis_source_sink_core.png"), dpi=200)
     plt.close()
 
-    # --- RESTORED PLOT C: MIGRANT RISK VIA CROSS-CORRELATION ---
     print("Calculating true path-integrated outgoing risk...")
     
     if Q_grid.ndim == 4:
@@ -647,32 +946,23 @@ def diagnose_st_weights(sim, data, output_dir):
     print("Diagnosing Spatio-Temporal Regularization (Spatial Confounding)...")
     st_weights = sim['st_weights']
     
-    # Extract the environmental survival weights
     beta_s = sim['w_env'][:, 0]
     
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
     
-    # --- PANEL 1: Sparsity Check (The Histogram) ---
-    # We use a log-scale on the y-axis because a healthy Laplace prior 
-    # will have 95% of its weights pinned exactly at 0.0
     axes[0].hist(st_weights, bins=50, color='purple', edgecolor='black', log=True)
     axes[0].set_title("Distribution of Spatio-Temporal Weights\n(Healthy = Massive spike at 0)")
     axes[0].set_xlabel("Learned Weight Value")
     axes[0].set_ylabel("Frequency (Log Scale)")
     
-    # --- PANEL 2: Variance Share (The Spatial Impact) ---
-    # We evaluate a representative middle year to check the spatial magnitude
     t_idx = data['time'] // 2
     
-    # Pull data arrays for that year
     z_t = np.array(data['Z_gathered'][t_idx]) 
     st_basis_t = np.array(data['st_basis'][:, t_idx, :]) 
     
-    # Reconstruct the two competing spatial fields
-    H_env = np.dot(z_t, beta_s)                     # The Biology
-    H_st = np.dot(st_basis_t.T, st_weights)         # The Mathematical Noise
+    H_env = np.dot(z_t, beta_s)                     
+    H_st = np.dot(st_basis_t.T, st_weights)         
     
-    # Calculate how much "energy" (standard deviation) is in each field
     std_env = np.std(H_env)
     std_st = np.std(H_st)
     
@@ -684,7 +974,6 @@ def diagnose_st_weights(sim, data, output_dir):
     axes[1].set_title("Variance Contribution to Latent Manifold")
     axes[1].set_ylabel("Standard Deviation of Spatial Field")
     
-    # Annotate the Noise-to-Signal ratio
     ratio = std_st / (std_env + 1e-9)
     axes[1].text(0.5, max(std_env, std_st) * 0.9, f"Noise-to-Signal Ratio: {ratio:.2f}x", 
                  ha='center', va='top', fontsize=12, bbox=dict(facecolor='white', alpha=0.9))
@@ -696,7 +985,6 @@ def diagnose_st_weights(sim, data, output_dir):
 # --- MAIN ---
 
 def plot_results():
-    # UPDATED: Loaded data FIRST to fix NameError for K_kernels fallback
     data = load_data_to_gpu(INPUT_DIR, precision=PRECISION)
     with open(os.path.join(RESULT_DIR, "map_params.pkl"), 'rb') as f: params = pickle.load(f)
 
@@ -726,30 +1014,24 @@ def plot_results():
 
     sim_cf = reconstruct_simulation(data, params_no_inv)
 
-    # 2. Diagnostic Counter-Factual (No Invasion + No Spatial Noise)
+    # 3. Diagnostic Counter-Factual (No Invasion + No Spatial Noise)
     params_diagnostic = params.copy()
     
-    # Disable invasion
-    inv_key = 'inv_eta_auto_loc' 
     if inv_key in params_diagnostic:
         params_diagnostic[inv_key] = jnp.full_like(params_diagnostic[inv_key], -100.0)
         
-    # ZERO OUT THE SPATIAL "ESCAPE HATCH"
     params_diagnostic['st_weights_auto_loc'] = jnp.zeros_like(params_diagnostic['st_weights_auto_loc'])
     
-    # Run simulation with original data but silenced weights
     sim_diagnostic = reconstruct_simulation(data, params_diagnostic)
     
     Ny, Nx = data['Ny'], data['Nx']
     rows, cols = data['land_rows'], data['land_cols']
     years = data['years']
     
-    # Extract Total Densities
     density = np.array(sim['simulated_density']) * data['pop_scalar']
     density_cf = np.array(sim_cf['simulated_density']) * data['pop_scalar']
     density_cf_diag = np.array(sim_diagnostic['simulated_density']) * data['pop_scalar']
     
-    # Map 1D arrays back to 2D Spatial Grids
     Sa_grid = scatter_to_grid_robust(np.array(sim['Sa_flat']), rows, cols, (Ny, Nx))
     Sj_grid = scatter_to_grid_robust(np.array(sim['Sj_flat']), rows, cols, (Ny, Nx))
     Fmax_grid = scatter_to_grid_robust(np.array(sim['Fmax_flat']), rows, cols, (Ny, Nx))
@@ -760,18 +1042,23 @@ def plot_results():
 
     start_idx = np.where(years >= 1960)[0][0]
     
-    # Rebuild explicit N_a and N_j pools via forward pass
     Na_grid, Nj_grid = rebuild_age_pools(sim, data, params)
 
     # --- Execute Diagnostics ---
 
-    # Original Animations
+    # 1. Cleanly map the exact point estimates for the environmental profiles
+    sim['beta_s'] = sim['w_env'][:, 0]
+    sim['beta_r'] = sim['w_env'][:, 1]
+    
+    # 2. Call the suite.
+    characterize_Z_dependence_suite(sim, data, OUTPUT_PLOT_DIR)
+    # ----------------------
+    
     create_animation(density_cf_diag, obs_grid, years, OUTPUT_PLOT_DIR, data['land_mask'], "evolution_counterfactual_diagnostic_logscale.mp4", logscale=True)
     create_animation(density_cf_diag, obs_grid, years, OUTPUT_PLOT_DIR, data['land_mask'], "evolution_counterfactual_diagnostic.mp4")
     create_animation(density, obs_grid, years, OUTPUT_PLOT_DIR, data['land_mask'])
     create_animation(density_cf, obs_grid, years, OUTPUT_PLOT_DIR, data['land_mask'], "evolution_counterfactual.mp4")
 
-    # New Temporal Analysis
     diagnose_st_weights(sim, data, OUTPUT_PLOT_DIR)
     plot_demographic_timeseries(data, years[start_idx:], Sa_grid[start_idx:], Sj_grid[start_idx:], Fmax_grid[start_idx:], K_grid[start_idx:], OUTPUT_PLOT_DIR)
     plot_habitat_shift_map(data, Sa_grid[start_idx:], Sj_grid[start_idx:], Fmax_grid[start_idx:], OUTPUT_PLOT_DIR)
@@ -780,13 +1067,10 @@ def plot_results():
     plot_spatial_residuals(obs_grid, density, OUTPUT_PLOT_DIR, data['land_mask'])
     plot_directional_asymmetry(data, Sa_grid[start_idx:], Sj_grid[start_idx:], Fmax_grid[start_idx:], Q_grid[start_idx:], labels, OUTPUT_PLOT_DIR)
 
-    # Age-Structured Analysis
     plot_demographic_baselines(data, Sa_grid[start_idx:], Sj_grid[start_idx:], Fmax_grid[start_idx:], K_grid[start_idx:], OUTPUT_PLOT_DIR)
     plot_age_structure_dynamics(Na_grid, Nj_grid, years, OUTPUT_PLOT_DIR, data['land_mask'])
     analyze_source_sink_mortality(data, Sa_grid[start_idx:], Sj_grid[start_idx:], Fmax_grid[start_idx:], Q_grid[start_idx:], OUTPUT_PLOT_DIR)
 
-
-    
     print(f"All diagnostics complete. Results at: {OUTPUT_PLOT_DIR}")
 
 if __name__ == "__main__":

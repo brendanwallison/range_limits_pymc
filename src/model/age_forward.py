@@ -96,21 +96,22 @@ def dispersal_step_age_structured(
 def reproduction_age_structured(
     N_a_post, N_j_post, 
     S_a, S_j, F_max, K, 
-    allee_scalar, allee_intercept, 
+    allee_gamma,
     eps=1e-12
 ):
     N_total_post = N_a_post + N_j_post
     K_safe = jnp.maximum(K, eps)
 
-    # 1. Calculate Density-Dependent Fecundity (Beverton-Holt style)
-    # The c parameter ensures F_eff drops to replacement rate when N == K
+    # 1. Density-Dependent Fecundity (Beverton-Holt)
+    # Ensures F_eff drops to replacement rate when N == K
     c = (F_max * S_j) / (1.0 - S_a + eps) - 1.0
-    c = jnp.maximum(c, 0.0) # Safety clip
+    c = jnp.maximum(c, 0.0) 
     
     F_eff = F_max / (1.0 + c * (N_total_post / K_safe))
     
-    # 2. Allee effect (applies to reproduction)
-    allee_factor = jnn.sigmoid(N_total_post * allee_scalar + allee_intercept)
+    # 2. Exponential Allee Effect (Mate-Finding Probability)
+    # Probability of finding >= 1 mate: 1 - P(finding 0 mates)
+    allee_factor = 1.0 - jnp.exp(-allee_gamma * N_total_post)
     F_actual = F_eff * allee_factor
     
     # 3. State Transitions
@@ -118,7 +119,6 @@ def reproduction_age_structured(
     N_a_new = (N_a_post * S_a) + (N_j_post * S_j)
     
     # Juveniles: New offspring produced by surviving adults
-    # (Assuming post-breeding census where adults breed after surviving)
     N_j_new = (N_a_post * S_a) * F_actual
     
     return N_a_new, N_j_new
@@ -132,7 +132,7 @@ def forward_sim_age_structured(
     initpop_latent, dispersal_random, inv_pop,
     time, inv_location, inv_timestep,
     dispersal_logit_intercept, dispersal_logit_slope,
-    allee_scalar, allee_intercept,
+    allee_gamma,
     pseudo_zero, target_fraction=0.8
 ):
     Ny, Nx = land_mask.shape
@@ -182,7 +182,7 @@ def forward_sim_age_structured(
         N_a_new, N_j_new = reproduction_age_structured(
             N_a_post, N_j_post, 
             Sa_g, Sj_g, Fmax_g, K_g, 
-            allee_scalar, allee_intercept, 
+            allee_gamma, 
             eps=1e-12
         )
         

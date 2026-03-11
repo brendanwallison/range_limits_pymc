@@ -28,7 +28,7 @@ from src.model.age_priors import build_model_2d
 # --- CONFIGURATION ---
 INPUT_DIR = "/home/breallis/processed_data/model_inputs/numpyro_input"
 # Updated output directory to separate the age-structured results
-OUTPUT_DIR = f"/home/breallis/processed_data/model_results/age_map_{PRECISION}_run_09"
+OUTPUT_DIR = f"/home/breallis/processed_data/model_results/age_map_{PRECISION}_run_10"
 
 def load_data_to_gpu(input_dir, precision='float32'):
     meta_path = os.path.join(input_dir, "metadata.pkl")
@@ -92,7 +92,7 @@ def run_map():
     guide = AutoDelta(build_model_2d)
 
     # 1. Define your total training iterations (e.g., your full SVI run)
-    total_steps = 10000 
+    total_steps = 30000 
 
     # 2. Create the Cosine Decay scheduler
     scheduler = optax.cosine_decay_schedule(

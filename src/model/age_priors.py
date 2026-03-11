@@ -13,7 +13,7 @@ def sample_priors(anneal=1.0, M_features=None, N_basis=None, time=None):
     
     # 1. Sample rho explicitly with a strong positive prior (e.g., centered at +0.7).
     # We bound it strictly between -0.99 and 0.99 to prevent NaN errors in the Cholesky math.
-    rho = numpyro.sample("rho", dist.TruncatedNormal(loc=0.7, scale=0.2, low=-0.99, high=0.99))
+    rho = numpyro.sample("rho", dist.TruncatedNormal(loc=0.5, scale=0.2, low=-0.99, high=0.99))
     
     # 2. Manually construct the Cholesky factor of a 2x2 correlation matrix
     # The Cholesky decomposition of [[1, rho], [rho, 1]] is analytically:
@@ -55,28 +55,33 @@ def sample_priors(anneal=1.0, M_features=None, N_basis=None, time=None):
     # --- 2. DEMOGRAPHIC INTERCEPTS (Alphas) ---
     # Adult survival baseline > Juvenile survival baseline
     priors['alpha_a'] = numpyro.sample("alpha_a", dist.Normal(1.5, 0.5 * anneal)) # ~80%
-    priors['alpha_j'] = numpyro.sample("alpha_j", dist.Normal(-0.5, 0.5 * anneal)) # ~38%
+    priors['alpha_j'] = numpyro.sample("alpha_j", dist.Normal(0.0, 0.5 * anneal)) # ~50%
     priors['alpha_f'] = numpyro.sample("alpha_f", dist.Normal(1.0, 0.5 * anneal))  # Fecundity
     priors['alpha_k'] = numpyro.sample("alpha_k", dist.Normal(0.5, 0.5 * anneal))  # Capacity
     
     # --- 3. DEMOGRAPHIC SLOPES (Gammas) ---
     # Enforce positive slopes: better habitat = higher survival/fecundity
     # Enforce Rule 5: Juvenile survival is more sensitive to environment than adult
-    gamma_a_raw = numpyro.sample("gamma_a_raw", dist.Normal(0.5, 0.5 * anneal))
-    gamma_j_diff = numpyro.sample("gamma_j_diff", dist.HalfNormal(1.0 * anneal))
+    gamma_a_raw = numpyro.sample("gamma_a_raw", dist.Normal(0.5, 1.0 * anneal))
+    gamma_j_diff = numpyro.sample("gamma_j_diff", dist.HalfNormal(0.5 * anneal))
     
     priors['gamma_a'] = jnn.softplus(gamma_a_raw)
     priors['gamma_j'] = priors['gamma_a'] + gamma_j_diff 
     
-    priors['gamma_f'] = jnn.softplus(numpyro.sample("gamma_f_raw", dist.Normal(0.0, 0.5 * anneal)))
-    priors['gamma_k'] = jnn.softplus(numpyro.sample("gamma_k_raw", dist.Normal(0.0, 0.5 * anneal)))
+    priors['gamma_f'] = jnn.softplus(numpyro.sample("gamma_f_raw", dist.Normal(0.0, 1.0 * anneal)))
+    priors['gamma_k'] = jnn.softplus(numpyro.sample("gamma_k_raw", dist.Normal(0.0, 1.0 * anneal)))
     
-    # --- 4. ALLEE & DISPERSAL SCALARS ---
-    priors['allee_intercept'] = numpyro.sample("allee_intercept", dist.Normal(-2.0, 1.0 * anneal))
-    priors['allee_slope'] = jnn.softplus(numpyro.sample("allee_slope_raw", dist.Normal(0.0, 1.0 * anneal)))
-    
-    priors['dispersal_logit_intercept'] = numpyro.sample("dispersal_logit_intercept", dist.Normal(2.0, 0.5 * anneal))
-    priors['dispersal_logit_slope'] = numpyro.sample("dispersal_logit_slope", dist.Normal(4.0, 0.5 * anneal))
+    # Sample the physical threshold (N50: number of birds for 50% mate-finding prob)
+    # Standard normal + softplus = mean of ~0.86
+    n50_raw = numpyro.sample("n50_raw", dist.Normal(-1.0, 1.0))
+    n50 = jnn.softplus(n50_raw)
+
+    # Derive the searching efficiency on the RAW count scale
+    # gamma_raw = ln(2) / N50
+    priors['gamma_raw'] = jnp.log(2.0) / (n50 + 1e-6)
+
+    priors['dispersal_logit_intercept'] = numpyro.sample("dispersal_logit_intercept", dist.Normal(2.0, 1.0 * anneal))
+    priors['dispersal_logit_slope'] = numpyro.sample("dispersal_logit_slope", dist.Normal(4.0, 1.0 * anneal))
     
     # Temporal Annual Noise (Maintained for dispersal probability fluctuations)
     priors['dispersal_random'] = numpyro.sample("dispersal_random", dist.Normal(0., 0.001 * anneal), sample_shape=(time,))
@@ -94,9 +99,14 @@ def build_model_2d(data, anneal=1.0):
     priors = sample_priors(anneal, M, data['N_basis'], time)
     
     inv_pop = jnn.softplus(numpyro.sample(
-        "inv_eta", dist.Normal(-1.0, 1.0 * anneal), sample_shape=(data['inv_window'],)
+        "inv_eta", dist.Normal(-2.0, 1.0 * anneal), sample_shape=(data['inv_window'],)
     ))
-    allee_scalar = data['pop_scalar'] * priors['allee_slope']
+    
+    # Convert to the relative [0, 1] scale by multiplying by pop_scalar
+    # Since N_relative = N_raw / pop_scalar, 
+    # then gamma_relative = gamma_raw * pop_scalar
+    allee_gamma_scaled = priors['gamma_raw'] * data['pop_scalar']
+    priors['allee_gamma'] = numpyro.deterministic("allee_gamma", allee_gamma_scaled)
 
     # --- IDENTIFIABILITY CONSTRAINT: 50/50 STABLE AGE STRUCTURE ---
     # Calculate global means based on intercepts
@@ -109,7 +119,7 @@ def build_model_2d(data, anneal=1.0):
     juvenile_fraction = F_mean / (F_mean + lambda_mean)
 
     # Soft constraint pulling the model's global baselines toward 50/50
-    numpyro.factor("age_structure_constraint", dist.Normal(0.5, 0.01).log_prob(juvenile_fraction))
+    numpyro.factor("age_structure_constraint", dist.Normal(0.5, 0.1).log_prob(juvenile_fraction))
 
     # 2. Compute Biological Fields (2D Manifold -> Demographic Rates)
     # Notice we now pass beta_s and beta_r instead of a single beta_h
@@ -141,7 +151,7 @@ def build_model_2d(data, anneal=1.0):
         data['initpop_latent'], priors['dispersal_random'], inv_pop,
         time, data['inv_location'], data['inv_timestep'],
         priors['dispersal_logit_intercept'], priors['dispersal_logit_slope'],
-        allee_scalar, priors['allee_intercept'],
+        priors['allee_gamma'],
         data['pseudo_zero']
     )
 
