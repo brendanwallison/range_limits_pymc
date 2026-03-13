@@ -40,8 +40,8 @@ def project_and_scatter_age_structured(
         S_j_val = jnn.sigmoid(alpha_j + gamma_j * H_s_local)
         
         # Reproduction listens to H_r
-        F_max_val = jnp.exp(alpha_f + gamma_f * H_r_local)
-        K_val = jnp.exp(alpha_k + gamma_k * H_r_local)
+        F_max_val = jnn.softplus(alpha_f + gamma_f * H_r_local)
+        K_val = jnn.softplus(alpha_k + gamma_k * H_r_local)
         
         # 5. Map Path Habitat (H_s) to Journey Survival (Q) using juvenile rules
         # This perfectly links movement mortality to local survival mortality

@@ -13,7 +13,7 @@ def sample_priors(anneal=1.0, M_features=None, N_basis=None, time=None):
     
     # 1. Sample rho explicitly with a strong positive prior (e.g., centered at +0.7).
     # We bound it strictly between -0.99 and 0.99 to prevent NaN errors in the Cholesky math.
-    rho = numpyro.sample("rho", dist.TruncatedNormal(loc=0.5, scale=0.2, low=-0.99, high=0.99))
+    rho = numpyro.sample("rho", dist.TruncatedNormal(loc=0.7, scale=0.2, low=-0.99, high=0.99))
     
     # 2. Manually construct the Cholesky factor of a 2x2 correlation matrix
     # The Cholesky decomposition of [[1, rho], [rho, 1]] is analytically:
@@ -41,7 +41,7 @@ def sample_priors(anneal=1.0, M_features=None, N_basis=None, time=None):
     
     # 1D spectral weights (Spatio-temporal random effects)
     # 1. Define the global budget for spatial noise (e.g., 0.1 allows for moderate regional tweaks)
-    global_spatial_budget = 0.0001 * anneal
+    global_spatial_budget = 0.001 * anneal
     
     # 2. Distribute that budget dynamically 
     dynamic_scale = global_spatial_budget / jnp.sqrt(N_basis)
@@ -54,16 +54,16 @@ def sample_priors(anneal=1.0, M_features=None, N_basis=None, time=None):
     
     # --- 2. DEMOGRAPHIC INTERCEPTS (Alphas) ---
     # Adult survival baseline > Juvenile survival baseline
-    priors['alpha_a'] = numpyro.sample("alpha_a", dist.Normal(1.5, 0.5 * anneal)) # ~80%
-    priors['alpha_j'] = numpyro.sample("alpha_j", dist.Normal(0.0, 0.5 * anneal)) # ~50%
-    priors['alpha_f'] = numpyro.sample("alpha_f", dist.Normal(1.0, 0.5 * anneal))  # Fecundity
+    priors['alpha_a'] = numpyro.sample("alpha_a", dist.Normal(0.5, 0.5 * anneal)) # ~60%
+    priors['alpha_j'] = numpyro.sample("alpha_j", dist.Normal(-0.5, 0.5 * anneal)) # ~40%
+    priors['alpha_f'] = numpyro.sample("alpha_f", dist.Normal(2.0, 0.5 * anneal))  # Fecundity
     priors['alpha_k'] = numpyro.sample("alpha_k", dist.Normal(0.5, 0.5 * anneal))  # Capacity
     
     # --- 3. DEMOGRAPHIC SLOPES (Gammas) ---
     # Enforce positive slopes: better habitat = higher survival/fecundity
     # Enforce Rule 5: Juvenile survival is more sensitive to environment than adult
-    gamma_a_raw = numpyro.sample("gamma_a_raw", dist.Normal(0.5, 1.0 * anneal))
-    gamma_j_diff = numpyro.sample("gamma_j_diff", dist.HalfNormal(0.5 * anneal))
+    gamma_a_raw = numpyro.sample("gamma_a_raw", dist.Normal(0.0, 0.5 * anneal))
+    gamma_j_diff = numpyro.sample("gamma_j_diff", dist.HalfNormal(0.5))
     
     priors['gamma_a'] = jnn.softplus(gamma_a_raw)
     priors['gamma_j'] = priors['gamma_a'] + gamma_j_diff 
@@ -112,7 +112,7 @@ def build_model_2d(data, anneal=1.0):
     # Calculate global means based on intercepts
     S_a_mean = jnn.sigmoid(priors['alpha_a'])
     S_j_mean = jnn.sigmoid(priors['alpha_j'])
-    F_mean = jnp.exp(priors['alpha_f'])
+    F_mean = jnn.softplus(priors['alpha_f'])
 
     # Calculate theoretical stable age structure (dominant eigenvalue of Leslie matrix)
     lambda_mean = (S_a_mean + jnp.sqrt(S_a_mean**2 + 4 * F_mean * S_j_mean)) / 2.0

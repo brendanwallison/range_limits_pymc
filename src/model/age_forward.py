@@ -57,7 +57,7 @@ def dispersal_step_age_structured(
     # -----------------------------
     # 1. Total Dispersal Probability (Density Dependent)
     # -----------------------------
-    K_safe = K + eps
+    K_safe = jnp.maximum(K, eps)
     z_total = dispersal_logit_intercept + dispersal_logit_slope * (N_total / K_safe - target_fraction)
     z_total = clip_safe(z_total) 
     p_total = jnn.sigmoid(z_total)
@@ -87,40 +87,48 @@ def dispersal_step_age_structured(
         eps
     )
     
-    # Note: Q is applied inside the vectorized function to movers.
-    # Stayers don't pay path mortality.
-    N_j_post = juvenile_stayers + juvenile_arriving
+    # # Note: Q is applied inside the vectorized function to movers.
+    # # Stayers don't pay path mortality.
+    # N_j_post = juvenile_stayers + juvenile_arriving
 
-    return N_a_post, N_j_post
+    return N_a_post, juvenile_stayers, juvenile_arriving
 
 def reproduction_age_structured(
-    N_a_post, N_j_post, 
-    S_a, S_j, F_max, K, 
+    N_a_post,
+    N_j_stayers,
+    N_j_arrivers,
+    S_a, S_j, F_max, K,
     allee_gamma,
     eps=1e-12
-):
-    N_total_post = N_a_post + N_j_post
+    ):
+    # Total density after dispersal (both juvenile pools count)
+    N_total_post = N_a_post + N_j_stayers + N_j_arrivers
     K_safe = jnp.maximum(K, eps)
 
-    # 1. Density-Dependent Fecundity (Beverton-Holt)
-    # Ensures F_eff drops to replacement rate when N == K
+    # --- Density-Dependent Fecundity (Beverton-Holt) ---
+    # Uses Sj because stayers experience Sj before maturation
     c = (F_max * S_j) / (1.0 - S_a + eps) - 1.0
-    c = jnp.maximum(c, 0.0) 
-    
+    c = jnp.maximum(c, 0.0)
+
     F_eff = F_max / (1.0 + c * (N_total_post / K_safe))
-    
-    # 2. Exponential Allee Effect (Mate-Finding Probability)
-    # Probability of finding >= 1 mate: 1 - P(finding 0 mates)
+
+    # --- Allee Effect ---
     allee_factor = 1.0 - jnp.exp(-allee_gamma * N_total_post)
     F_actual = F_eff * allee_factor
-    
-    # 3. State Transitions
-    # Adults: Surviving adults + surviving juveniles that matured
-    N_a_new = (N_a_post * S_a) + (N_j_post * S_j)
-    
-    # Juveniles: New offspring produced by surviving adults
-    N_j_new = (N_a_post * S_a) * F_actual
-    
+
+    # --- Adult survival ---
+    surviving_adults = N_a_post * S_a
+
+    # --- Juvenile survival ---
+    surviving_stayers = N_j_stayers * S_j      # stayers experience Sj
+    surviving_arrivers = N_j_arrivers          # dispersers already paid Q
+
+    # --- Adult pool update ---
+    N_a_new = surviving_adults + surviving_stayers + surviving_arrivers
+
+    # --- Juvenile production ---
+    N_j_new = surviving_adults * F_actual
+
     return N_a_new, N_j_new
 
 def forward_sim_age_structured(
@@ -170,7 +178,7 @@ def forward_sim_age_structured(
         )
 
         # 3. Dispersal
-        N_a_post, N_j_post = dispersal_step_age_structured(
+        N_a_post, juvenile_stayers, juvenile_arriving = dispersal_step_age_structured(
             N_a, N_j, K_g, 
             dispersal_logit_intercept, dispersal_logit_slope, target_fraction,
             adult_edge_correction, juvenile_edge_correction_stack,
@@ -180,12 +188,13 @@ def forward_sim_age_structured(
         
         # 4. Survival & Reproduction (Age-Structured Update)
         N_a_new, N_j_new = reproduction_age_structured(
-            N_a_post, N_j_post, 
-            Sa_g, Sj_g, Fmax_g, K_g, 
-            allee_gamma, 
-            eps=1e-12
+            N_a_post,
+            juvenile_stayers,
+            juvenile_arriving,
+            Sa_g, Sj_g, Fmax_g, K_g,
+            allee_gamma
         )
-        
+            
         # 5. Mask & Final Clip
         N_a_new = jnp.maximum(N_a_new * land_mask, 0.0)
         N_j_new = jnp.maximum(N_j_new * land_mask, 0.0)

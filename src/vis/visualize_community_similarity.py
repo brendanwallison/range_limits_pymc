@@ -27,7 +27,7 @@ PRECISION = 'float32'
 jax.config.update("jax_enable_x64", True if PRECISION == 'float64' else False)
 
 INPUT_DIR = "/home/breallis/processed_data/model_inputs/numpyro_input"
-RESULT_DIR = f"/home/breallis/processed_data/model_results/age_map_{PRECISION}_run_10"
+RESULT_DIR = f"/home/breallis/processed_data/model_results/age_map_{PRECISION}_run_14"
 EBIRD_DIR = "/home/breallis/datasets/ebird_weekly_2023_albers"
 
 OUTPUT_PLOT_DIR = os.path.join(RESULT_DIR, "plots_community_mimicry")
@@ -51,8 +51,9 @@ def reconstruct_simulation(data, params):
     
     # We now need the demographic parameters to calculate R0
     return_sites = [
-        "w_env", "alpha_a", "alpha_j", "alpha_f",
-        "gamma_a_raw", "gamma_j_diff", "gamma_f_raw"
+        "w_env", "alpha_a", "alpha_j", "alpha_f", "alpha_k",
+        "gamma_a_raw", "gamma_j_diff", "gamma_f_raw", "gamma_k_raw",
+        "allee_gamma", "n50_raw"
     ]
     
     predictive = Predictive(model, guide=guide, params=params, num_samples=1, return_sites=return_sites)

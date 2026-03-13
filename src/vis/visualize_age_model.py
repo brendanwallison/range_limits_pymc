@@ -30,7 +30,7 @@ PRECISION = 'float32'
 jax.config.update("jax_enable_x64", True if PRECISION == 'float64' else False)
 
 INPUT_DIR = "/home/breallis/processed_data/model_inputs/numpyro_input"
-RESULT_DIR = f"/home/breallis/processed_data/model_results/age_map_{PRECISION}_run_10"
+RESULT_DIR = f"/home/breallis/processed_data/model_results/age_map_{PRECISION}_run_14"
 OUTPUT_PLOT_DIR = os.path.join(RESULT_DIR, "plots_analysis")
 os.makedirs(OUTPUT_PLOT_DIR, exist_ok=True)
 
@@ -545,7 +545,8 @@ def reconstruct_simulation(data, params):
         "dispersal_logit_intercept", "dispersal_logit_slope",
         "n50_raw", "allee_gamma",
         "alpha_a", "alpha_j", "alpha_f", "alpha_k",
-        "gamma_a_raw", "gamma_j_diff", "gamma_f_raw"
+        "gamma_a_raw", "gamma_j_diff", "gamma_f_raw",
+        "rho", "w_scale", "L_corr"
     ]
 
     
@@ -577,38 +578,34 @@ def rebuild_age_pools(sim, data, params):
     Ny, Nx = data['Ny'], data['Nx']
     row, col = data['inv_location']
     
-    # Use the _auto_loc suffix for parameters sampled directly in the model
+    # Suffixes for raw params
     inv_pop = jnn.softplus(params['inv_eta_auto_loc'])
-    
-    # Pull the pre-scaled, pre-transformed gamma directly from the sim dict
-    # This was saved via numpyro.deterministic("allee_gamma", ...)
-    allee_gamma = sim['allee_gamma'] 
-    
-    # Pull dispersal parameters (standardizing the suffix usage)
     disp_log_int = params['dispersal_logit_intercept_auto_loc']
     disp_log_slope = params['dispersal_logit_slope_auto_loc']
+    
+    # Pre-scaled Allee gamma from sim
+    allee_gamma = sim['allee_gamma'] 
 
     def step(pools, t):
         N_a, N_j = pools
         
-        # 1. Invasion logic
+        # 1. Invasion
         k = t - data['inv_timestep']
         is_invading = (k >= 0) & (k < inv_pop.shape[0])
         val = jnp.where(is_invading, inv_pop[jnp.clip(k, 0, inv_pop.shape[0]-1)], 0.0)
         N_a = N_a.at[row, col].add(val)
 
-        # 2. Scatter params (Pulling from the reconstructed sim fields)
+        # 2. Scatter params
         Sa_g = jnp.zeros((Ny, Nx)).at[data['land_rows'], data['land_cols']].set(sim['Sa_flat'][t])
         Sj_g = jnp.zeros((Ny, Nx)).at[data['land_rows'], data['land_cols']].set(sim['Sj_flat'][t])
         Fmax_g = jnp.zeros((Ny, Nx)).at[data['land_rows'], data['land_cols']].set(sim['Fmax_flat'][t])
         K_g = jnp.zeros((Ny, Nx)).at[data['land_rows'], data['land_cols']].set(sim['K_flat'][t])
-        
         Q_t = sim['Q_flat'][t]
         Q_temp = jnp.zeros((Ny, Nx, Q_t.shape[-1])).at[data['land_rows'], data['land_cols'], :].set(Q_t)
         Q_g = Q_temp.transpose(2, 0, 1)
 
-        # 3. Dispersal
-        N_a_post, N_j_post = dispersal_step_age_structured(
+        # 3. Dispersal (Updated to return 3 pools)
+        N_a_post, juvenile_stayers, juvenile_arriving = dispersal_step_age_structured(
             N_a, N_j, K_g, 
             disp_log_int, disp_log_slope, 0.8,
             data['adult_edge_correction'], data['juvenile_edge_correction_stack'],
@@ -616,11 +613,13 @@ def rebuild_age_pools(sim, data, params):
             Q_grid=Q_g, eps=1e-6
         )
         
-        # 4. Survival & Reproduction (The Allee-corrected step)
+        # 4. Survival & Reproduction (Updated Signature)
         N_a_new, N_j_new = reproduction_age_structured(
-            N_a_post, N_j_post, Sa_g, Sj_g, Fmax_g, K_g, 
-            allee_gamma, # Now pre-scaled and pre-transformed
-            eps=1e-12
+            N_a_post,
+            juvenile_stayers,
+            juvenile_arriving,
+            Sa_g, Sj_g, Fmax_g, K_g,
+            allee_gamma
         )
         
         N_a_new = jnp.maximum(N_a_new * data['land_mask'], 0.0)
@@ -1070,6 +1069,10 @@ def plot_results():
     plot_demographic_baselines(data, Sa_grid[start_idx:], Sj_grid[start_idx:], Fmax_grid[start_idx:], K_grid[start_idx:], OUTPUT_PLOT_DIR)
     plot_age_structure_dynamics(Na_grid, Nj_grid, years, OUTPUT_PLOT_DIR, data['land_mask'])
     analyze_source_sink_mortality(data, Sa_grid[start_idx:], Sj_grid[start_idx:], Fmax_grid[start_idx:], Q_grid[start_idx:], OUTPUT_PLOT_DIR)
+
+    # Inside plot_results:
+    n50_learned = jnn.softplus(sim['n50_raw'])
+    print(f"--- Model Diagnostic: Learned Allee N50 is {n50_learned:.4f} birds ---")
 
     print(f"All diagnostics complete. Results at: {OUTPUT_PLOT_DIR}")
 
